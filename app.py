@@ -4,9 +4,7 @@ import json
 import os
 import re
 import uuid
-import imaplib
 import smtplib
-from email import message_from_bytes
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
@@ -22,9 +20,69 @@ except Exception:
     OpenAI = None  # type: ignore
 
 from graph_client import GraphClient, GraphConfig, GraphAPIError, GraphAuthError
-from audit_log import AuditLog
-from ics_utils import ICSInvite, stable_uid
-from timezone_utils import to_utc, from_utc, iso_utc
+from audit_log import AuditLog, LogLevel, log_structured
+from ics_utils import ICSInvite, stable_uid, ICSValidationError
+from timezone_utils import to_utc, from_utc, iso_utc, is_valid_timezone, safe_zoneinfo
+
+
+# ----------------------------
+# Input Validation
+# ----------------------------
+import re as _re
+from typing import Tuple as _Tuple
+
+# Email regex (RFC 5322 simplified)
+_EMAIL_REGEX = _re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+# Date/time patterns from OpenAI output
+_DATE_REGEX = _re.compile(r'^\d{4}-\d{2}-\d{2}$')
+_TIME_REGEX = _re.compile(r'^\d{2}:\d{2}$')
+
+
+class ValidationError(ValueError):
+    """Raised when input validation fails."""
+    def __init__(self, field: str, message: str):
+        self.field = field
+        self.message = message
+        super().__init__(f"{field}: {message}")
+
+
+def validate_email(email: str, field_name: str = "email") -> str:
+    """Validate email format. Returns cleaned email or raises ValidationError."""
+    if not email:
+        raise ValidationError(field_name, "Email is required")
+    email = email.strip().lower()
+    if not _EMAIL_REGEX.match(email):
+        raise ValidationError(field_name, f"Invalid email format: {email}")
+    if len(email) > 254:  # RFC 5321 limit
+        raise ValidationError(field_name, "Email too long (max 254 characters)")
+    return email
+
+
+def validate_email_optional(email: Optional[str], field_name: str = "email") -> Optional[str]:
+    """Validate email if provided, return None if empty."""
+    if not email or not email.strip():
+        return None
+    return validate_email(email, field_name)
+
+
+def validate_slot(slot: dict) -> _Tuple[str, str, str]:
+    """Validate slot dict from OpenAI parsing. Returns (date, start, end) tuple."""
+    if not isinstance(slot, dict):
+        raise ValidationError("slot", "Slot must be a dictionary")
+
+    date = slot.get("date", "")
+    start = slot.get("start", "")
+    end = slot.get("end", "")
+
+    if not _DATE_REGEX.match(date):
+        raise ValidationError("slot.date", f"Invalid date format: {date}. Expected YYYY-MM-DD")
+    if not _TIME_REGEX.match(start):
+        raise ValidationError("slot.start", f"Invalid start time format: {start}. Expected HH:MM")
+    if end and not _TIME_REGEX.match(end):
+        raise ValidationError("slot.end", f"Invalid end time format: {end}. Expected HH:MM")
+
+    return date, start, end
 
 
 # ----------------------------
@@ -142,19 +200,58 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
             if isinstance(s, dict) and all(k in s for k in ("date", "start", "end")):
                 valid_slots.append({"date": str(s["date"]), "start": str(s["start"]), "end": str(s["end"])})
         return valid_slots
+    except json.JSONDecodeError as e:
+        st.error(f"OpenAI returned invalid JSON: {e}")
+        log_structured(
+            LogLevel.ERROR,
+            f"OpenAI JSON parse error: {e}",
+            action="parse_slots_openai",
+            error_type="json_decode_error",
+        )
+        return []
     except Exception as e:
         st.error(f"Failed to parse availability via OpenAI: {e}")
+        log_structured(
+            LogLevel.ERROR,
+            f"OpenAI vision API error: {e}",
+            action="parse_slots_openai",
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
         return []
 
 
 def pdf_to_images(pdf_bytes: bytes, max_pages: int = 3) -> List[Image.Image]:
+    """Convert PDF to images. Returns empty list on error instead of crashing."""
     images: List[Image.Image] = []
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    for i in range(min(len(doc), max_pages)):
-        page = doc.load_page(i)
-        pix = page.get_pixmap(dpi=200)
-        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-        images.append(img)
+    doc = None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for i in range(min(len(doc), max_pages)):
+            try:
+                page = doc.load_page(i)
+                pix = page.get_pixmap(dpi=200)
+                img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+                images.append(img)
+            except Exception as e:
+                log_structured(
+                    LogLevel.WARNING,
+                    f"Failed to process PDF page {i}: {e}",
+                    action="pdf_page_process",
+                    error_type="pdf_error",
+                )
+    except Exception as e:
+        st.error(f"Failed to open PDF: {e}")
+        log_structured(
+            LogLevel.ERROR,
+            f"Failed to open PDF: {e}",
+            action="pdf_open",
+            error_type="pdf_error",
+            exc_info=True,
+        )
+    finally:
+        if doc:
+            doc.close()
     return images
 
 
@@ -255,8 +352,33 @@ def send_email_smtp(
             server.login(cfg["username"], cfg["password"])
             server.send_message(msg)
         return True
+    except smtplib.SMTPAuthenticationError as e:
+        st.error(f"SMTP authentication failed: {e}")
+        log_structured(
+            LogLevel.ERROR,
+            f"SMTP authentication failed: {e}",
+            action="smtp_send",
+            error_type="smtp_auth_error",
+        )
+        return False
+    except smtplib.SMTPException as e:
+        st.error(f"SMTP send failed: {e}")
+        log_structured(
+            LogLevel.ERROR,
+            f"SMTP send failed: {e}",
+            action="smtp_send",
+            error_type="smtp_error",
+        )
+        return False
     except Exception as e:
         st.error(f"SMTP send failed: {e}")
+        log_structured(
+            LogLevel.ERROR,
+            f"SMTP send failed: {e}",
+            action="smtp_send",
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
         return False
 
 
@@ -296,63 +418,79 @@ def send_email_graph(
         return False
 
 
-def fetch_unread_emails_imap() -> List[Dict[str, Any]]:
+def fetch_unread_emails_graph() -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
     """
-    Fetch unread emails from IMAP inbox (optional feature for 'Scheduler Inbox').
+    Fetch unread emails from scheduler mailbox via Microsoft Graph API.
+    Returns (emails, error_message, is_configured) tuple.
+    - error_message is None on success
+    - is_configured is False if Graph credentials are missing
 
-    Secrets (optional):
-      - imap_server, imap_port (default 993), imap_username, imap_password
+    Uses the same Graph credentials as calendar operations.
     """
-    required = ["imap_server", "imap_username", "imap_password"]
-    if any(get_secret(k) is None for k in required):
-        return []
+    cfg = get_graph_config()
+    if not cfg:
+        return [], None, False  # Graph not configured
 
-    imap_server = str(get_secret("imap_server"))
-    imap_port = int(get_secret("imap_port", 993))
-    imap_username = str(get_secret("imap_username"))
-    imap_password = str(get_secret("imap_password"))
-
-    emails: List[Dict[str, Any]] = []
     try:
-        mail = imaplib.IMAP4_SSL(imap_server, imap_port)
-        mail.login(imap_username, imap_password)
-        mail.select("INBOX")
+        from graph_client import GraphClient
+        client = GraphClient(cfg)
+        messages = client.fetch_unread_messages(top=50)
 
-        typ, data = mail.search(None, "UNSEEN")
-        if typ != "OK":
-            return []
+        emails: List[Dict[str, Any]] = []
+        for msg in messages:
+            from_addr = ""
+            from_data = msg.get("from", {})
+            if from_data:
+                email_addr = from_data.get("emailAddress", {})
+                from_addr = email_addr.get("address", "")
 
-        for num in data[0].split():
-            typ, msg_data = mail.fetch(num, "(RFC822)")
-            if typ != "OK":
-                continue
-            raw = msg_data[0][1]
-            msg = message_from_bytes(raw)
-            emails.append(
-                {
-                    "from": msg.get("From", ""),
-                    "subject": msg.get("Subject", ""),
-                    "date": msg.get("Date", ""),
-                    "body": _extract_email_body(msg),
-                }
-            )
-        mail.logout()
-    except Exception:
-        # keep silent-ish; Inbox is optional
-        return []
-    return emails
+            # Get body content (prefer text, fall back to HTML)
+            body_content = msg.get("bodyPreview", "")
+            body_data = msg.get("body", {})
+            if body_data and body_data.get("content"):
+                body_content = body_data.get("content", "")
+                # Strip HTML tags if content type is HTML
+                if body_data.get("contentType") == "html":
+                    import re
+                    body_content = re.sub(r'<[^>]+>', '', body_content)
+                    body_content = body_content.strip()
 
+            emails.append({
+                "id": msg.get("id", ""),
+                "from": from_addr,
+                "subject": msg.get("subject", ""),
+                "date": msg.get("receivedDateTime", ""),
+                "body": body_content,
+            })
 
-def _extract_email_body(msg) -> str:
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            disp = str(part.get("Content-Disposition", ""))
-            if ctype == "text/plain" and "attachment" not in disp:
-                return (part.get_payload(decode=True) or b"").decode(errors="ignore")
-    else:
-        return (msg.get_payload(decode=True) or b"").decode(errors="ignore")
-    return ""
+        return emails, None, True  # Success, configured
+
+    except GraphAuthError as e:
+        log_structured(
+            LogLevel.ERROR,
+            f"Graph authentication failed: {e}",
+            action="graph_fetch_messages",
+            error_type="graph_auth_error",
+        )
+        return [], f"Graph authentication failed: {e}", True
+    except GraphAPIError as e:
+        log_structured(
+            LogLevel.ERROR,
+            f"Graph API error: {e}",
+            action="graph_fetch_messages",
+            error_type="graph_api_error",
+            details={"status_code": e.status_code},
+        )
+        return [], f"Graph API error: {e}", True
+    except Exception as e:
+        log_structured(
+            LogLevel.ERROR,
+            f"Failed to fetch emails via Graph: {e}",
+            action="graph_fetch_messages",
+            error_type="graph_error",
+            exc_info=True,
+        )
+        return [], f"Failed to fetch emails: {e}", True
 
 
 def detect_slot_choice_from_text(text: str, slots: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
@@ -629,10 +767,14 @@ def main() -> None:
     # ========= TAB: Scheduler Inbox =========
     with tab_inbox:
         st.subheader("Scheduler Inbox")
-        st.caption("Optional: reads UNSEEN emails from an IMAP inbox to detect candidate slot choices.")
-        emails = fetch_unread_emails_imap()
-        if not emails:
-            st.info("No IMAP configuration found, or no unread emails.")
+        st.caption("Reads unread emails from the scheduler mailbox via Microsoft Graph API.")
+        emails, graph_error, is_configured = fetch_unread_emails_graph()
+        if not is_configured:
+            st.warning("Graph API is not configured. Add graph_tenant_id, graph_client_id, graph_client_secret, and graph_scheduler_mailbox to your secrets.")
+        elif graph_error:
+            st.error(f"Failed to fetch emails: {graph_error}")
+        elif not emails:
+            st.success("✓ Connected to mailbox. No unread emails found.")
         else:
             st.write(f"Found {len(emails)} unread email(s).")
             for i, e in enumerate(emails, start=1):
@@ -817,8 +959,11 @@ def _parse_availability_upload(upload) -> List[Dict[str, str]]:
 
 
 def _zoneinfo(tz_name: str):
-    from zoneinfo import ZoneInfo
-    return ZoneInfo(tz_name)
+    """Get ZoneInfo with validation. Falls back to UTC if invalid."""
+    zi, was_valid = safe_zoneinfo(tz_name, fallback="UTC")
+    if not was_valid:
+        st.warning(f"Invalid timezone '{tz_name}', using UTC")
+    return zi
 
 
 def _common_timezones() -> List[str]:
@@ -867,23 +1012,62 @@ def _handle_create_invite(
     recruiter: Tuple[str, str],
     include_recruiter: bool,
 ) -> None:
-    candidate_email, candidate_name = candidate
-    hm_email, hm_name = hiring_manager
-    rec_email, rec_name = recruiter
+    candidate_email_raw, candidate_name = candidate
+    hm_email_raw, hm_name = hiring_manager
+    rec_email_raw, rec_name = recruiter
 
-    # Parse selected slot into a local datetime
-    # slot contains date + start time
+    # === INPUT VALIDATION ===
+    # Validate timezone
+    if not is_valid_timezone(tz_name):
+        st.warning(f"Invalid timezone '{tz_name}', using UTC")
+        tz_name = "UTC"
+
+    # Validate emails
     try:
-        start_local_naive = datetime.fromisoformat(f"{selected_slot['date']}T{selected_slot['start']}:00")
-    except Exception:
-        st.error("Selected slot has invalid date/time.")
+        candidate_email = validate_email(candidate_email_raw, "Candidate email")
+        hm_email = validate_email(hm_email_raw, "Hiring manager email")
+        rec_email = validate_email_optional(rec_email_raw, "Recruiter email")
+    except ValidationError as e:
+        st.error(f"Validation error: {e.message}")
         return
 
-    start_local = start_local_naive.replace(tzinfo=_zoneinfo(tz_name))
+    # Validate slot format
+    try:
+        validate_slot(selected_slot)
+    except ValidationError as e:
+        st.error(f"Invalid time slot: {e.message}")
+        return
+
+    # Parse selected slot into a local datetime
+    try:
+        start_local_naive = datetime.fromisoformat(f"{selected_slot['date']}T{selected_slot['start']}:00")
+    except ValueError as e:
+        st.error(f"Selected slot has invalid date/time format: {e}")
+        return
+
+    zi, _ = safe_zoneinfo(tz_name, fallback="UTC")
+    start_local = start_local_naive.replace(tzinfo=zi)
     end_local = start_local + timedelta(minutes=duration_minutes)
 
     start_utc = to_utc(start_local)
     end_utc = to_utc(end_local)
+
+    # === IDEMPOTENCY CHECK ===
+    existing = audit.interview_exists(
+        candidate_email=candidate_email,
+        hiring_manager_email=hm_email,
+        role_title=role_title,
+        start_utc=iso_utc(start_utc),
+    )
+    if existing:
+        st.warning(
+            f"An interview already exists for this candidate at this time. "
+            f"Event ID: {existing.get('graph_event_id', 'N/A')}"
+        )
+        # Use a unique key based on the slot to avoid Streamlit duplicate key errors
+        checkbox_key = f"force_dup_{selected_slot['date']}_{selected_slot['start']}"
+        if not st.checkbox("Create duplicate anyway?", key=checkbox_key):
+            return
 
     attendees: List[Tuple[str, str]] = [(candidate_email, candidate_name), (hm_email, hm_name)]
     if include_recruiter and rec_email:
