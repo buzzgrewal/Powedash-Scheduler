@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List
+from typing import Dict, List, Optional
 
 
 def _fold_ical_line(line: str, limit: int = 75) -> str:
@@ -59,6 +59,182 @@ def stable_uid(*parts: str) -> str:
     return f"{h}@powerdashhr.com"
 
 
+# VTIMEZONE definitions for common timezones
+# These follow RFC 5545 VTIMEZONE component structure
+_VTIMEZONE_DEFS: Dict[str, Dict] = {
+    "America/Los_Angeles": {
+        "tzid": "America/Los_Angeles",
+        "standard": {
+            "tzoffsetfrom": "-0700",
+            "tzoffsetto": "-0800",
+            "tzname": "PST",
+            "dtstart": "19701101T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+        },
+        "daylight": {
+            "tzoffsetfrom": "-0800",
+            "tzoffsetto": "-0700",
+            "tzname": "PDT",
+            "dtstart": "19700308T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+        },
+    },
+    "America/Denver": {
+        "tzid": "America/Denver",
+        "standard": {
+            "tzoffsetfrom": "-0600",
+            "tzoffsetto": "-0700",
+            "tzname": "MST",
+            "dtstart": "19701101T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+        },
+        "daylight": {
+            "tzoffsetfrom": "-0700",
+            "tzoffsetto": "-0600",
+            "tzname": "MDT",
+            "dtstart": "19700308T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+        },
+    },
+    "America/Chicago": {
+        "tzid": "America/Chicago",
+        "standard": {
+            "tzoffsetfrom": "-0500",
+            "tzoffsetto": "-0600",
+            "tzname": "CST",
+            "dtstart": "19701101T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+        },
+        "daylight": {
+            "tzoffsetfrom": "-0600",
+            "tzoffsetto": "-0500",
+            "tzname": "CDT",
+            "dtstart": "19700308T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+        },
+    },
+    "America/New_York": {
+        "tzid": "America/New_York",
+        "standard": {
+            "tzoffsetfrom": "-0400",
+            "tzoffsetto": "-0500",
+            "tzname": "EST",
+            "dtstart": "19701101T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+        },
+        "daylight": {
+            "tzoffsetfrom": "-0500",
+            "tzoffsetto": "-0400",
+            "tzname": "EDT",
+            "dtstart": "19700308T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+        },
+    },
+    "Europe/London": {
+        "tzid": "Europe/London",
+        "standard": {
+            "tzoffsetfrom": "+0100",
+            "tzoffsetto": "+0000",
+            "tzname": "GMT",
+            "dtstart": "19701025T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU",
+        },
+        "daylight": {
+            "tzoffsetfrom": "+0000",
+            "tzoffsetto": "+0100",
+            "tzname": "BST",
+            "dtstart": "19700329T010000",
+            "rrule": "FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU",
+        },
+    },
+    "Europe/Paris": {
+        "tzid": "Europe/Paris",
+        "standard": {
+            "tzoffsetfrom": "+0200",
+            "tzoffsetto": "+0100",
+            "tzname": "CET",
+            "dtstart": "19701025T030000",
+            "rrule": "FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU",
+        },
+        "daylight": {
+            "tzoffsetfrom": "+0100",
+            "tzoffsetto": "+0200",
+            "tzname": "CEST",
+            "dtstart": "19700329T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU",
+        },
+    },
+    "Australia/Sydney": {
+        "tzid": "Australia/Sydney",
+        "standard": {
+            "tzoffsetfrom": "+1100",
+            "tzoffsetto": "+1000",
+            "tzname": "AEST",
+            "dtstart": "19700405T030000",
+            "rrule": "FREQ=YEARLY;BYMONTH=4;BYDAY=1SU",
+        },
+        "daylight": {
+            "tzoffsetfrom": "+1000",
+            "tzoffsetto": "+1100",
+            "tzname": "AEDT",
+            "dtstart": "19701004T020000",
+            "rrule": "FREQ=YEARLY;BYMONTH=10;BYDAY=1SU",
+        },
+    },
+}
+
+
+def _generate_vtimezone(tz_name: str) -> List[str]:
+    """
+    Generate VTIMEZONE component for iCalendar.
+
+    Args:
+        tz_name: IANA timezone name
+
+    Returns:
+        List of iCalendar lines for VTIMEZONE component.
+        Empty list for UTC or unsupported timezones.
+    """
+    if not tz_name or tz_name == "UTC":
+        return []  # UTC doesn't need VTIMEZONE
+
+    if tz_name not in _VTIMEZONE_DEFS:
+        return []  # Fall back to UTC times for unsupported TZs
+
+    tz = _VTIMEZONE_DEFS[tz_name]
+    lines = [
+        "BEGIN:VTIMEZONE",
+        f"TZID:{tz['tzid']}",
+    ]
+
+    if "standard" in tz:
+        s = tz["standard"]
+        lines.extend([
+            "BEGIN:STANDARD",
+            f"TZOFFSETFROM:{s['tzoffsetfrom']}",
+            f"TZOFFSETTO:{s['tzoffsetto']}",
+            f"TZNAME:{s['tzname']}",
+            f"DTSTART:{s['dtstart']}",
+            f"RRULE:{s['rrule']}",
+            "END:STANDARD",
+        ])
+
+    if "daylight" in tz:
+        d = tz["daylight"]
+        lines.extend([
+            "BEGIN:DAYLIGHT",
+            f"TZOFFSETFROM:{d['tzoffsetfrom']}",
+            f"TZOFFSETTO:{d['tzoffsetto']}",
+            f"TZNAME:{d['tzname']}",
+            f"DTSTART:{d['dtstart']}",
+            f"RRULE:{d['rrule']}",
+            "END:DAYLIGHT",
+        ])
+
+    lines.append("END:VTIMEZONE")
+    return lines
+
+
 class ICSValidationError(ValueError):
     """Raised when ICS invite data is invalid."""
     pass
@@ -76,6 +252,7 @@ class ICSInvite:
     attendee_emails: List[str]
     location: str = ""
     url: str = ""  # e.g. Teams join URL
+    display_timezone: str = "UTC"  # IANA timezone for VTIMEZONE component
 
     def __post_init__(self):
         """Validate ICS invite data on construction."""
@@ -100,6 +277,9 @@ class ICSInvite:
         """
         Generate ICS file content as bytes.
         Raises ICSValidationError if generation fails.
+
+        If display_timezone is set to a supported timezone, includes a VTIMEZONE
+        component for proper DST handling by calendar applications.
         """
         try:
             now = datetime.now(timezone.utc)
@@ -109,6 +289,13 @@ class ICSInvite:
                 "VERSION:2.0",
                 "CALSCALE:GREGORIAN",
                 "METHOD:REQUEST",
+            ]
+
+            # Add VTIMEZONE component if timezone is supported (not UTC)
+            vtimezone_lines = _generate_vtimezone(self.display_timezone)
+            lines.extend(vtimezone_lines)
+
+            lines.extend([
                 "BEGIN:VEVENT",
                 f"UID:{self.uid}",
                 f"DTSTAMP:{_fmt_dt_utc(now)}",
@@ -118,7 +305,7 @@ class ICSInvite:
                 f"DESCRIPTION:{_escape_text(self.description + (('\\n' + self.url) if self.url else ''))}",
                 "STATUS:CONFIRMED",
                 "SEQUENCE:0",
-            ]
+            ])
 
             if self.location:
                 lines.append(f"LOCATION:{_escape_text(self.location)}")

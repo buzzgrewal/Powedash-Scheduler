@@ -170,6 +170,18 @@ class AuditLog:
                     """
                 )
                 conn.commit()
+
+                # Migration: Add candidate_timezone column if missing
+                try:
+                    conn.execute("SELECT candidate_timezone FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN candidate_timezone TEXT")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added candidate_timezone column to interviews table",
+                        action="db_migration",
+                    )
             finally:
                 conn.close()
         except sqlite3.Error as e:
@@ -278,6 +290,7 @@ class AuditLog:
         start_utc: str,
         end_utc: str,
         display_timezone: str,
+        candidate_timezone: str,
         graph_event_id: str,
         teams_join_url: str,
         subject: str,
@@ -285,6 +298,9 @@ class AuditLog:
     ) -> bool:
         """
         Insert interview record. Returns True on success, False on failure.
+
+        Args:
+            candidate_timezone: IANA timezone for the candidate (used for invitation display)
         """
         try:
             conn = self._connect()
@@ -293,9 +309,9 @@ class AuditLog:
                     """
                     INSERT INTO interviews (
                         created_utc, role_title, candidate_email, hiring_manager_email, recruiter_email,
-                        duration_minutes, start_utc, end_utc, display_timezone,
+                        duration_minutes, start_utc, end_utc, display_timezone, candidate_timezone,
                         graph_event_id, teams_join_url, subject, last_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         utc_now_iso(),
@@ -307,6 +323,7 @@ class AuditLog:
                         start_utc,
                         end_utc,
                         display_timezone,
+                        candidate_timezone,
                         graph_event_id,
                         teams_join_url,
                         subject,

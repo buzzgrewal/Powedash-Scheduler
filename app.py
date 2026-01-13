@@ -165,7 +165,16 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
 
     prompt = (
         "You are extracting FREE time slots from a calendar screenshot.\n"
-        "Return ONLY valid JSON (no markdown) as a list of objects with keys: date (YYYY-MM-DD), start (HH:MM), end (HH:MM).\n"
+        "Return ONLY valid JSON (no markdown) as a list of objects with keys:\n"
+        "  - date (YYYY-MM-DD)\n"
+        "  - start (HH:MM in 24-hour format)\n"
+        "  - end (HH:MM in 24-hour format)\n"
+        "  - inferred_tz (timezone abbreviation if visible, e.g. 'PST', 'EST', 'GMT', or null if not visible)\n\n"
+        "Look for timezone indicators in:\n"
+        "  - Calendar headers or footers\n"
+        "  - Corner labels (e.g., 'Times shown in PST')\n"
+        "  - Time displays with timezone suffix (e.g., '2:00 PM EST')\n"
+        "  - UTC offset indicators (e.g., 'GMT-8')\n\n"
         "Only include free slots that are at least 30 minutes.\n"
         "If no slots found, return an empty list []."
     )
@@ -198,7 +207,15 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
         valid_slots = []
         for s in slots:
             if isinstance(s, dict) and all(k in s for k in ("date", "start", "end")):
-                valid_slots.append({"date": str(s["date"]), "start": str(s["start"]), "end": str(s["end"])})
+                slot_data = {
+                    "date": str(s["date"]),
+                    "start": str(s["start"]),
+                    "end": str(s["end"]),
+                }
+                # Preserve inferred timezone if present
+                if s.get("inferred_tz"):
+                    slot_data["inferred_tz"] = str(s["inferred_tz"])
+                valid_slots.append(slot_data)
         return valid_slots
     except json.JSONDecodeError as e:
         st.error(f"OpenAI returned invalid JSON: {e}")
@@ -449,6 +466,7 @@ def ensure_session_state() -> None:
         "last_invite_uid": "",
         "last_invite_ics_bytes": b"",
         "selected_timezone": get_default_timezone(),
+        "candidate_timezone": get_default_timezone(),
         "duration_minutes": 30,
     }
     for k, v in defaults.items():
@@ -458,6 +476,27 @@ def ensure_session_state() -> None:
 
 def format_slot_label(slot: Dict[str, str]) -> str:
     return f"{slot['date']} {slot['start']}–{slot['end']}"
+
+
+def extract_common_timezone(slots: List[Dict[str, str]]) -> Optional[str]:
+    """
+    Extract the most common inferred timezone from parsed slots.
+
+    Returns IANA timezone or None if no timezone was inferred.
+    """
+    from collections import Counter
+    from timezone_utils import infer_timezone_from_abbreviation
+
+    tz_abbrevs = [s.get("inferred_tz") for s in slots if s.get("inferred_tz")]
+    if not tz_abbrevs:
+        return None
+
+    # Get most common abbreviation
+    most_common = Counter(tz_abbrevs).most_common(1)[0][0]
+
+    # Convert to IANA timezone name
+    iana_tz, matched, _ = infer_timezone_from_abbreviation(most_common)
+    return iana_tz if matched else None
 
 
 # ----------------------------
@@ -754,6 +793,7 @@ def _build_ics(
     location: str,
     url: str,
     uid_hint: str,
+    display_timezone: str = "UTC",
 ) -> bytes:
     uid = stable_uid(uid_hint, organizer_email, ",".join(attendee_emails), dtstart_utc.isoformat())
     inv = ICSInvite(
@@ -767,6 +807,7 @@ def _build_ics(
         attendee_emails=attendee_emails,
         location=location,
         url=url,
+        display_timezone=display_timezone,
     )
     return inv.to_ics()
 
@@ -821,6 +862,21 @@ def main() -> None:
                 key="selected_timezone",
             )
 
+            # Real-time clock showing current time in selected timezone vs system timezone
+            from timezone_utils import from_utc
+            now_utc = datetime.now(timezone.utc)
+            now_system = datetime.now().astimezone()  # System local time
+            system_tz_name = now_system.strftime("%Z")  # e.g., "PST", "GMT"
+
+            try:
+                now_selected = from_utc(now_utc, tz_name)
+                selected_time = now_selected.strftime("%I:%M %p %Z")
+                system_time = now_system.strftime("%I:%M %p %Z")
+
+                st.caption(f"🕐 **{tz_name}**: {selected_time} | **Your system ({system_tz_name})**: {system_time}")
+            except:
+                pass
+
             parse_btn = st.button("Parse Availability", type="primary")
 
             if parse_btn and upload is not None:
@@ -834,6 +890,64 @@ def main() -> None:
                 slot_labels = [format_slot_label(s) for s in st.session_state["slots"]]
                 selected_label = st.selectbox("Select slot", options=slot_labels, key="selected_slot_label")
                 selected_slot = st.session_state["slots"][slot_labels.index(selected_label)]
+
+                # Real-time timezone conversion preview
+                if selected_slot:
+                    from timezone_utils import safe_zoneinfo, from_utc, format_time_for_display
+                    try:
+                        # Parse the slot time as display timezone
+                        slot_dt_naive = datetime.strptime(
+                            f"{selected_slot['date']}T{selected_slot['start']}:00",
+                            "%Y-%m-%dT%H:%M:%S"
+                        )
+                        zi, _ = safe_zoneinfo(tz_name, fallback="UTC")
+                        slot_dt_local = slot_dt_naive.replace(tzinfo=zi)
+
+                        # Convert to UTC for reference
+                        from timezone_utils import to_utc
+                        slot_utc = to_utc(slot_dt_local)
+
+                        # Show conversion to common timezones
+                        st.markdown("**Time Conversion Preview:**")
+                        preview_tzs = ["UTC", "America/New_York", "America/Los_Angeles", "Europe/London", "Asia/Tokyo"]
+                        # Add display timezone if not in list
+                        if tz_name not in preview_tzs:
+                            preview_tzs.insert(0, tz_name)
+
+                        conversion_items = []
+                        for preview_tz in preview_tzs:
+                            try:
+                                converted = from_utc(slot_utc, preview_tz)
+                                time_str = converted.strftime("%a %b %d, %I:%M %p %Z")
+                                # Highlight the display timezone
+                                if preview_tz == tz_name:
+                                    conversion_items.append(f"**{preview_tz}**: {time_str} *(selected)*")
+                                else:
+                                    conversion_items.append(f"{preview_tz}: {time_str}")
+                            except Exception:
+                                pass
+
+                        st.caption(" | ".join(conversion_items[:4]))  # Show top 4
+                    except (ValueError, TypeError):
+                        pass  # Skip preview on invalid date
+
+                # DST Warning Check
+                if selected_slot:
+                    from timezone_utils import is_near_dst_transition
+                    try:
+                        slot_date = datetime.strptime(selected_slot["date"], "%Y-%m-%d").date()
+                        slot_dt = datetime.combine(slot_date, datetime.min.time())
+
+                        # Check display timezone for DST transition
+                        is_near, trans_date, trans_type = is_near_dst_transition(slot_dt, tz_name, days_threshold=7)
+                        if is_near and trans_date:
+                            direction = "spring forward" if trans_type == "spring_forward" else "fall back"
+                            st.warning(
+                                f"DST Alert: Clocks {direction} on {trans_date.strftime('%B %d, %Y')} "
+                                f"in {tz_name}. Please verify the scheduled time."
+                            )
+                    except (ValueError, TypeError):
+                        pass  # Skip DST check on invalid date
             else:
                 st.info("No slots extracted yet. Upload a calendar view and click Parse Availability.")
                 selected_slot = None
@@ -842,6 +956,44 @@ def main() -> None:
             st.markdown("#### Candidate")
             candidate_name = st.text_input("Candidate Name", key="cand_name")
             candidate_email = st.text_input("Candidate Email (required)", key="cand_email")
+
+            # Candidate timezone - pre-populate with inferred timezone from calendar
+            inferred_tz = extract_common_timezone(st.session_state.get("slots", []))
+            if inferred_tz:
+                # Update session state if inference found a timezone
+                st.session_state["candidate_timezone"] = inferred_tz
+
+            candidate_tz_default = st.session_state.get("candidate_timezone", get_default_timezone())
+            candidate_tz_idx = _common_timezones().index(candidate_tz_default) if candidate_tz_default in _common_timezones() else 0
+
+            candidate_timezone = st.selectbox(
+                "Candidate Timezone",
+                options=_common_timezones(),
+                index=candidate_tz_idx,
+                key="candidate_timezone_select",
+                help="Times in the invitation will be shown in this timezone"
+            )
+
+            if inferred_tz and inferred_tz == candidate_timezone:
+                st.caption("Auto-detected from calendar screenshot")
+
+            # Show candidate's view of the selected time
+            if selected_slot:
+                from timezone_utils import safe_zoneinfo, to_utc, from_utc, format_datetime_for_display
+                try:
+                    slot_dt_naive = datetime.strptime(
+                        f"{selected_slot['date']}T{selected_slot['start']}:00",
+                        "%Y-%m-%dT%H:%M:%S"
+                    )
+                    zi, _ = safe_zoneinfo(tz_name, fallback="UTC")
+                    slot_dt_local = slot_dt_naive.replace(tzinfo=zi)
+                    slot_utc = to_utc(slot_dt_local)
+
+                    # Show what candidate will see
+                    candidate_view = format_datetime_for_display(slot_utc, candidate_timezone)
+                    st.success(f"Candidate will see: **{candidate_view}**")
+                except (ValueError, TypeError):
+                    pass
 
             st.markdown("#### Invite details")
             is_teams = st.selectbox("Interview type", options=["Teams", "Non-Teams"], index=0, key="interview_type") == "Teams"
@@ -891,6 +1043,7 @@ def main() -> None:
                     audit=audit,
                     selected_slot=selected_slot,
                     tz_name=tz_name,
+                    candidate_timezone=candidate_timezone,
                     duration_minutes=int(st.session_state["duration_minutes"]),
                     role_title=role_title,
                     subject=subject,
@@ -1204,6 +1357,7 @@ def _handle_create_invite(
     audit: AuditLog,
     selected_slot: Dict[str, str],
     tz_name: str,
+    candidate_timezone: str,
     duration_minutes: int,
     role_title: str,
     subject: str,
@@ -1220,10 +1374,14 @@ def _handle_create_invite(
     rec_email_raw, rec_name = recruiter
 
     # === INPUT VALIDATION ===
-    # Validate timezone
+    # Validate timezones
     if not is_valid_timezone(tz_name):
-        st.warning(f"Invalid timezone '{tz_name}', using UTC")
+        st.warning(f"Invalid display timezone '{tz_name}', using UTC")
         tz_name = "UTC"
+
+    if not is_valid_timezone(candidate_timezone):
+        st.warning(f"Invalid candidate timezone '{candidate_timezone}', using display timezone")
+        candidate_timezone = tz_name
 
     # Validate emails
     try:
@@ -1291,6 +1449,7 @@ def _handle_create_invite(
         location=("Microsoft Teams" if is_teams else (location or "Interview")),
         url="",
         uid_hint=f"{role_title}|{candidate_email}|{hm_email}",
+        display_timezone=candidate_timezone,
     )
     st.session_state["last_invite_ics_bytes"] = ics_bytes
     st.session_state["last_invite_uid"] = stable_uid(f"{role_title}|{candidate_email}|{hm_email}", organizer_email, start_utc.isoformat())
@@ -1310,14 +1469,21 @@ def _handle_create_invite(
         st.warning("Graph is not configured. Using .ics fallback only.")
         return
 
-    body_html = (agenda or "").replace("\n", "<br>")
+    # Format time display for candidate's timezone
+    from timezone_utils import format_datetime_for_display
+    candidate_time_display = format_datetime_for_display(start_utc, candidate_timezone)
+
+    # Build body with candidate-friendly time display
+    body_html = f"<p><strong>Interview Time (your timezone): {candidate_time_display}</strong></p>"
+    if agenda:
+        body_html += f"<p>{agenda.replace(chr(10), '<br>')}</p>"
 
     payload = _graph_event_payload(
         subject=subject,
         body_html=body_html,
         start_local=start_local,
         end_local=end_local,
-        time_zone=tz_name,
+        time_zone=candidate_timezone,  # Use candidate timezone for calendar event
         attendees=attendees,
         is_teams=is_teams,
         location=location,
@@ -1345,6 +1511,7 @@ def _handle_create_invite(
                 location="Microsoft Teams",
                 url=teams_url,
                 uid_hint=f"{role_title}|{candidate_email}|{hm_email}",
+                display_timezone=candidate_timezone,
             )
 
         audit.log(
@@ -1367,6 +1534,7 @@ def _handle_create_invite(
             start_utc=iso_utc(start_utc),
             end_utc=iso_utc(end_utc),
             display_timezone=tz_name,
+            candidate_timezone=candidate_timezone,
             graph_event_id=event_id,
             teams_join_url=teams_url,
             subject=subject,
