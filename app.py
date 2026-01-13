@@ -255,6 +255,192 @@ def pdf_to_images(pdf_bytes: bytes, max_pages: int = 3) -> List[Image.Image]:
     return images
 
 
+def docx_to_text(docx_bytes: bytes) -> str:
+    """
+    Extract text from a Word document including paragraphs and tables.
+    Returns empty string on error instead of crashing.
+    """
+    try:
+        from docx import Document as DocxDocument
+    except ImportError:
+        st.warning("python-docx not installed. Word document parsing unavailable.")
+        log_structured(
+            LogLevel.ERROR,
+            "python-docx not installed",
+            action="docx_import",
+            error_type="import_error",
+        )
+        return ""
+
+    try:
+        doc = DocxDocument(io.BytesIO(docx_bytes))
+        text_parts: List[str] = []
+
+        # Extract paragraphs
+        for para in doc.paragraphs:
+            para_text = para.text.strip()
+            if para_text:
+                text_parts.append(para_text)
+
+        # Extract tables (important for calendar/availability data)
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    text_parts.append(row_text)
+
+        return "\n".join(text_parts)
+    except Exception as e:
+        st.error(f"Failed to read Word document: {e}")
+        log_structured(
+            LogLevel.ERROR,
+            f"Failed to read Word document: {e}",
+            action="docx_read",
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
+        return ""
+
+
+def docx_extract_images(docx_bytes: bytes, max_images: int = 5) -> List[Image.Image]:
+    """
+    Extract embedded images from a Word document.
+    Returns empty list on error instead of crashing.
+    """
+    try:
+        from docx import Document as DocxDocument
+    except ImportError:
+        return []
+
+    images: List[Image.Image] = []
+    try:
+        doc = DocxDocument(io.BytesIO(docx_bytes))
+
+        # Access the document's related parts to find images
+        for rel in doc.part.rels.values():
+            if "image" in rel.reltype:
+                try:
+                    image_data = rel.target_part.blob
+                    img = Image.open(io.BytesIO(image_data)).convert("RGB")
+                    images.append(img)
+                    if len(images) >= max_images:
+                        break
+                except Exception as e:
+                    log_structured(
+                        LogLevel.WARNING,
+                        f"Failed to extract image from docx: {e}",
+                        action="docx_image_extract",
+                        error_type="image_error",
+                    )
+                    continue
+
+        return images
+    except Exception as e:
+        log_structured(
+            LogLevel.WARNING,
+            f"Failed to extract images from Word document: {e}",
+            action="docx_image_extract",
+            error_type=type(e).__name__,
+        )
+        return []
+
+
+def parse_slots_from_text(text: str) -> List[Dict[str, str]]:
+    """
+    Use OpenAI to parse free/busy text into slots.
+    Expected JSON format:
+    [
+      {"date": "2025-12-03", "start": "09:00", "end": "09:30"},
+      ...
+    ]
+    """
+    if not text or not text.strip():
+        return []
+
+    client = get_openai_client()
+    if not client:
+        return []
+
+    # Get current year for inference
+    current_year = datetime.now().year
+
+    prompt = f"""You are extracting FREE/AVAILABLE time slots from text describing someone's availability.
+
+IMPORTANT RULES:
+1. Only extract slots explicitly marked as FREE, AVAILABLE, or OPEN
+2. Do NOT include busy/blocked/unavailable times
+3. Convert all dates to YYYY-MM-DD format
+4. Convert all times to 24-hour HH:MM format
+5. If year is not specified, assume {current_year}
+6. If end time is not specified, assume 1 hour duration
+7. Only include slots that are at least 30 minutes
+
+DATE FORMAT EXAMPLES:
+- "Monday Dec 3" -> "{current_year}-12-03"
+- "12/03/2025" -> "2025-12-03"
+- "3rd December" -> "{current_year}-12-03"
+- "Dec 3, 2025" -> "2025-12-03"
+
+TIME FORMAT EXAMPLES:
+- "9am-10am" -> start: "09:00", end: "10:00"
+- "09:00-10:00" -> start: "09:00", end: "10:00"
+- "9:00 AM to 10:00 AM" -> start: "09:00", end: "10:00"
+- "2pm-3:30pm" -> start: "14:00", end: "15:30"
+
+Return ONLY valid JSON as a list of objects with keys: date, start, end.
+If no free slots found, return an empty list [].
+
+TEXT TO PARSE:
+{text}"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that returns strict JSON. Never include markdown formatting."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content.strip() if resp.choices else ""
+
+        # Strip code fences if present (same pattern as parse_slots_from_image)
+        if content.startswith("```"):
+            content = content.strip("`")
+            if "\n" in content:
+                content = content.split("\n", 1)[1].strip()
+
+        slots = json.loads(content) if content else []
+        valid_slots = []
+        for s in slots:
+            if isinstance(s, dict) and all(k in s for k in ("date", "start", "end")):
+                valid_slots.append({
+                    "date": str(s["date"]),
+                    "start": str(s["start"]),
+                    "end": str(s["end"])
+                })
+        return valid_slots
+    except json.JSONDecodeError as e:
+        st.error(f"OpenAI returned invalid JSON: {e}")
+        log_structured(
+            LogLevel.ERROR,
+            f"OpenAI JSON parse error: {e}",
+            action="parse_slots_text_openai",
+            error_type="json_decode_error",
+        )
+        return []
+    except Exception as e:
+        st.error(f"Failed to parse availability via OpenAI: {e}")
+        log_structured(
+            LogLevel.ERROR,
+            f"OpenAI text API error: {e}",
+            action="parse_slots_text_openai",
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
+        return []
+
+
 def ensure_session_state() -> None:
     defaults = {
         "slots": [],
@@ -619,8 +805,8 @@ def main() -> None:
         with col_center:
             st.markdown("#### Upload Availability")
             upload = st.file_uploader(
-                "Free/busy screenshot (PDF, PNG, JPG, JPEG)",
-                type=["pdf", "png", "jpg", "jpeg"],
+                "Free/busy screenshot (PDF, PNG, JPG, JPEG, DOCX)",
+                type=["pdf", "png", "jpg", "jpeg", "docx"],
                 key="availability_upload",
             )
             st.session_state["duration_minutes"] = st.number_input(
@@ -945,17 +1131,34 @@ def main() -> None:
 def _parse_availability_upload(upload) -> List[Dict[str, str]]:
     data = upload.read()
     name = (upload.name or "").lower()
+    slots: List[Dict[str, str]] = []
+
     if name.endswith(".pdf"):
         imgs = pdf_to_images(data, max_pages=3)
-        slots: List[Dict[str, str]] = []
         for img in imgs:
             slots.extend(parse_slots_from_image(img))
-        # de-dup
-        uniq = {(s["date"], s["start"], s["end"]): s for s in slots}
-        return list(uniq.values())
+
+    elif name.endswith(".docx"):
+        # Strategy: Extract text + tables, then also check embedded images
+
+        # 1. Parse text content (paragraphs + tables)
+        text = docx_to_text(data)
+        if text:
+            slots.extend(parse_slots_from_text(text))
+
+        # 2. Extract and parse embedded images (optional enhancement)
+        embedded_images = docx_extract_images(data, max_images=3)
+        for img in embedded_images:
+            slots.extend(parse_slots_from_image(img))
+
     else:
+        # Assume image file (png, jpg, jpeg)
         img = Image.open(io.BytesIO(data)).convert("RGB")
-        return parse_slots_from_image(img)
+        slots.extend(parse_slots_from_image(img))
+
+    # De-duplicate slots by (date, start, end) tuple
+    uniq = {(s["date"], s["start"], s["end"]): s for s in slots}
+    return list(uniq.values())
 
 
 def _zoneinfo(tz_name: str):
