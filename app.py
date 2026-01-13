@@ -6,6 +6,7 @@ import re
 import uuid
 import smtplib
 from email.message import EmailMessage
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, date, time
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -47,6 +48,31 @@ class ValidationError(ValueError):
         super().__init__(f"{field}: {message}")
 
 
+# Maximum number of candidates allowed in a single batch
+MAX_CANDIDATES = 20
+
+
+@dataclass
+class CandidateValidationResult:
+    """Result of validating a single candidate entry."""
+    original: str           # Original input string
+    email: Optional[str]    # Validated email (None if invalid)
+    name: str               # Parsed name (empty string if not provided)
+    is_valid: bool          # True if email is valid
+    error: Optional[str]    # Error message if invalid
+
+
+@dataclass
+class SchedulingResult:
+    """Result of scheduling an interview for one candidate."""
+    candidate_email: str
+    candidate_name: str
+    success: bool
+    event_id: Optional[str]
+    teams_url: Optional[str]
+    error: Optional[str]
+
+
 def validate_email(email: str, field_name: str = "email") -> str:
     """Validate email format. Returns cleaned email or raises ValidationError."""
     if not email:
@@ -64,6 +90,112 @@ def validate_email_optional(email: Optional[str], field_name: str = "email") -> 
     if not email or not email.strip():
         return None
     return validate_email(email, field_name)
+
+
+# Pattern for "Name <email>" format
+_NAME_EMAIL_PATTERN = _re.compile(r'^(.+?)\s*<([^>]+)>$')
+
+
+def _parse_single_candidate(entry: str) -> CandidateValidationResult:
+    """
+    Parse a single candidate entry.
+    Supports formats: 'email@example.com' or 'Name <email@example.com>'
+    """
+    entry = entry.strip()
+    if not entry:
+        return CandidateValidationResult(
+            original=entry,
+            email=None,
+            name="",
+            is_valid=False,
+            error="Empty entry"
+        )
+
+    # Try to match "Name <email>" format
+    match = _NAME_EMAIL_PATTERN.match(entry)
+    if match:
+        name = match.group(1).strip()
+        email_raw = match.group(2).strip()
+    else:
+        name = ""
+        email_raw = entry
+
+    try:
+        validated_email = validate_email(email_raw, "candidate email")
+        return CandidateValidationResult(
+            original=entry,
+            email=validated_email,
+            name=name,
+            is_valid=True,
+            error=None
+        )
+    except ValidationError as e:
+        return CandidateValidationResult(
+            original=entry,
+            email=None,
+            name=name,
+            is_valid=False,
+            error=e.message
+        )
+
+
+def parse_candidate_emails(raw_input: str) -> List[CandidateValidationResult]:
+    """
+    Parse semicolon-separated candidate emails with optional names.
+
+    Formats supported:
+    - "email@example.com"
+    - "Name <email@example.com>"
+    - "email1@example.com; email2@example.com"
+
+    Returns list of CandidateValidationResult objects with validation status.
+    Enforces MAX_CANDIDATES limit and detects duplicates.
+    """
+    results: List[CandidateValidationResult] = []
+    if not raw_input or not raw_input.strip():
+        return results
+
+    entries = [e.strip() for e in raw_input.split(';') if e.strip()]
+
+    # Check for exceeding limit
+    if len(entries) > MAX_CANDIDATES:
+        # Parse first MAX_CANDIDATES normally, mark rest as exceeding limit
+        for i, entry in enumerate(entries):
+            if i < MAX_CANDIDATES:
+                results.append(_parse_single_candidate(entry))
+            else:
+                results.append(CandidateValidationResult(
+                    original=entry,
+                    email=None,
+                    name="",
+                    is_valid=False,
+                    error=f"Exceeds maximum of {MAX_CANDIDATES} candidates"
+                ))
+        return results
+
+    # Track seen emails for duplicate detection
+    seen_emails: set = set()
+
+    for entry in entries:
+        result = _parse_single_candidate(entry)
+
+        # Check for duplicates among valid entries
+        if result.is_valid and result.email:
+            if result.email in seen_emails:
+                results.append(CandidateValidationResult(
+                    original=result.original,
+                    email=None,
+                    name=result.name,
+                    is_valid=False,
+                    error="Duplicate email address"
+                ))
+            else:
+                seen_emails.add(result.email)
+                results.append(result)
+        else:
+            results.append(result)
+
+    return results
 
 
 def validate_slot(slot: dict) -> _Tuple[str, str, str]:
@@ -1351,9 +1483,73 @@ def main() -> None:
                 selected_slot = None
 
         with col_right:
-            st.markdown("#### Candidate")
-            candidate_name = st.text_input("Candidate Name", key="cand_name")
-            candidate_email = st.text_input("Candidate Email (required)", key="cand_email")
+            st.markdown("#### Candidates")
+            st.caption("Enter one or more emails separated by semicolons. Format: email or Name <email>")
+
+            candidate_input = st.text_area(
+                "Candidate Email(s) (required)",
+                key="multi_cand_input",
+                height=80,
+                placeholder="john@example.com; Jane Doe <jane@example.com>; bob@example.com"
+            )
+
+            # Parse and validate candidates
+            candidate_results = parse_candidate_emails(candidate_input)
+            valid_candidates = [r for r in candidate_results if r.is_valid]
+            invalid_count = len(candidate_results) - len(valid_candidates)
+
+            # Display validation results
+            if candidate_results:
+                if valid_candidates and not invalid_count:
+                    st.success(f"All {len(valid_candidates)} candidate(s) validated")
+                elif valid_candidates and invalid_count:
+                    st.warning(f"{len(valid_candidates)} valid, {invalid_count} invalid candidate(s)")
+                elif invalid_count:
+                    st.error(f"All {invalid_count} candidate(s) have validation errors")
+
+                # Show validation details in expander
+                if len(candidate_results) > 1 or invalid_count > 0:
+                    with st.expander("Validation Details", expanded=bool(invalid_count)):
+                        for r in candidate_results:
+                            if r.is_valid:
+                                display_name = f"{r.name} ({r.email})" if r.name else r.email
+                                st.markdown(f":white_check_mark: {display_name}")
+                            else:
+                                st.markdown(f":x: {r.original} - {r.error}")
+
+            # Option to proceed with valid only when there are errors
+            proceed_with_valid = True
+            if invalid_count > 0 and len(valid_candidates) > 0:
+                proceed_with_valid = st.checkbox(
+                    f"Proceed with {len(valid_candidates)} valid candidate(s) only",
+                    value=True,
+                    key="proceed_with_valid"
+                )
+                if not proceed_with_valid:
+                    st.info("Fix invalid candidates before proceeding, or check the box above to skip them.")
+
+            # Scheduling mode selection (only show if multiple valid candidates)
+            scheduling_mode = "individual"
+            if len(valid_candidates) > 1:
+                st.markdown("##### Scheduling Mode")
+                scheduling_mode = st.radio(
+                    "How to schedule these candidates:",
+                    options=["individual", "group"],
+                    format_func=lambda x: {
+                        "individual": f"Individual Interviews - {len(valid_candidates)} separate invites",
+                        "group": "Group Interview - All candidates in one meeting"
+                    }[x],
+                    key="scheduling_mode",
+                    horizontal=True
+                )
+                if scheduling_mode == "individual":
+                    st.caption("Each candidate will receive their own calendar invite.")
+                else:
+                    st.caption("All candidates will be invited to a single shared meeting.")
+
+            # For backward compatibility, set candidate_email from first valid candidate
+            candidate_email = valid_candidates[0].email if valid_candidates else ""
+            candidate_name = valid_candidates[0].name if valid_candidates else ""
 
             # Candidate timezone - pre-populate with inferred timezone from calendar
             inferred_tz = extract_common_timezone(st.session_state.get("slots", []))
@@ -1444,25 +1640,37 @@ def main() -> None:
 
             # Determine if we have enough info to create invite
             has_interviewers = bool(panel_interviewers_for_invite) or bool(hiring_manager_email)
-            create_disabled = not (selected_slot and has_interviewers and candidate_email)
-            if st.button("Create & Send Interview Invite", disabled=create_disabled):
-                _handle_create_invite(
-                    audit=audit,
-                    selected_slot=selected_slot,
-                    tz_name=tz_name,
-                    candidate_timezone=candidate_timezone,
-                    duration_minutes=int(st.session_state["duration_minutes"]),
-                    role_title=role_title,
-                    subject=subject,
-                    agenda=agenda,
-                    location=location,
-                    is_teams=is_teams,
-                    candidate=(candidate_email, candidate_name),
-                    hiring_manager=(hiring_manager_email, hiring_manager_name),
-                    recruiter=(recruiter_email, recruiter_name),
-                    include_recruiter=include_recruiter,
-                    panel_interviewers=panel_interviewers_for_invite if panel_interviewers_for_invite else None,
-                )
+            has_valid_candidates = len(valid_candidates) > 0 and (proceed_with_valid or not invalid_count)
+            create_disabled = not (selected_slot and has_interviewers and has_valid_candidates)
+
+            # Button text reflects number of candidates
+            button_text = "Create & Send Interview Invite"
+            if len(valid_candidates) > 1:
+                button_text = f"Create & Send {len(valid_candidates)} Interview Invite(s)"
+
+            if st.button(button_text, disabled=create_disabled):
+                with st.spinner(f"Scheduling {len(valid_candidates)} interview(s)..."):
+                    results = _handle_multi_candidate_invite(
+                        audit=audit,
+                        selected_slot=selected_slot,
+                        tz_name=tz_name,
+                        candidate_timezone=candidate_timezone,
+                        duration_minutes=int(st.session_state["duration_minutes"]),
+                        role_title=role_title,
+                        subject=subject,
+                        agenda=agenda,
+                        location=location,
+                        is_teams=is_teams,
+                        candidates=valid_candidates,
+                        hiring_manager=(hiring_manager_email, hiring_manager_name),
+                        recruiter=(recruiter_email, recruiter_name),
+                        include_recruiter=include_recruiter,
+                        panel_interviewers=panel_interviewers_for_invite if panel_interviewers_for_invite else None,
+                        scheduling_mode=scheduling_mode,
+                    )
+
+                # Display batch results
+                _render_batch_results(results)
 
             # ICS fallback download button (available after generation)
             if st.session_state.get("last_invite_ics_bytes"):
@@ -1542,6 +1750,29 @@ def main() -> None:
         st.subheader("Calendar Invites")
         st.caption("Manage scheduled interviews (reschedule/cancel).")
 
+        def _format_candidates_display(interview_row: Dict[str, Any]) -> str:
+            """Format candidate display for table, handling multi-candidate interviews."""
+            candidates_json = interview_row.get("candidates_json")
+            if candidates_json:
+                try:
+                    candidates = json.loads(candidates_json)
+                    if len(candidates) > 2:
+                        return f"{candidates[0]['email']} +{len(candidates)-1} more"
+                    return "; ".join(c['email'] for c in candidates)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+            return interview_row.get("candidate_email", "")
+
+        def _format_interview_type(interview_row: Dict[str, Any]) -> str:
+            """Format interview type indicator."""
+            is_group = interview_row.get("is_group_interview")
+            is_panel = interview_row.get("is_panel_interview")
+            if is_group:
+                return "Group"
+            elif is_panel:
+                return "Panel"
+            return "Individual"
+
         interviews = audit.list_interviews(limit=200)
         if not interviews:
             st.info("No interviews stored yet. Create an invite from the first tab.")
@@ -1552,7 +1783,8 @@ def main() -> None:
                     {
                         "created_utc": r["created_utc"],
                         "role_title": r["role_title"],
-                        "candidate": r["candidate_email"],
+                        "type": _format_interview_type(r),
+                        "candidate(s)": _format_candidates_display(r),
                         "hiring_manager": r["hiring_manager_email"],
                         "start_utc": r["start_utc"],
                         "graph_event_id": r["graph_event_id"],
@@ -1858,6 +2090,608 @@ def _tz_index(tz_name: str | None) -> int:
     if tz_name and tz_name in tzs:
         return tzs.index(tz_name)
     return tzs.index(get_default_timezone()) if get_default_timezone() in tzs else 0
+
+
+def _render_batch_results(results: List[SchedulingResult]) -> None:
+    """Display results of batch scheduling operation."""
+    if not results:
+        return
+
+    successful = [r for r in results if r.success]
+    failed = [r for r in results if not r.success]
+
+    # Summary
+    st.markdown("### Scheduling Results")
+
+    if successful and not failed:
+        st.success(f"Successfully scheduled all {len(successful)} interview(s)")
+    elif successful and failed:
+        st.warning(f"Scheduled {len(successful)} interview(s), {len(failed)} failed")
+    else:
+        st.error(f"Failed to schedule all {len(failed)} interview(s)")
+
+    # Success details
+    if successful:
+        with st.expander(f"Successful ({len(successful)})", expanded=True):
+            for r in successful:
+                display = f"{r.candidate_name} ({r.candidate_email})" if r.candidate_name else r.candidate_email
+                st.markdown(f":white_check_mark: **{display}**")
+                if r.teams_url:
+                    st.link_button("Open Teams Link", r.teams_url, key=f"teams_{r.event_id}_{r.candidate_email}")
+
+    # Failure details
+    if failed:
+        with st.expander(f"Failed ({len(failed)})", expanded=True):
+            for r in failed:
+                display = f"{r.candidate_name} ({r.candidate_email})" if r.candidate_name else r.candidate_email
+                st.markdown(f":x: **{display}**")
+                st.caption(f"Error: {r.error}")
+
+
+def _handle_multi_candidate_invite(
+    *,
+    audit: AuditLog,
+    selected_slot: Dict[str, str],
+    tz_name: str,
+    candidate_timezone: str,
+    duration_minutes: int,
+    role_title: str,
+    subject: str,
+    agenda: str,
+    location: str,
+    is_teams: bool,
+    candidates: List[CandidateValidationResult],
+    hiring_manager: Tuple[str, str],
+    recruiter: Tuple[str, str],
+    include_recruiter: bool,
+    panel_interviewers: Optional[List[Dict[str, str]]] = None,
+    scheduling_mode: str = "individual",
+) -> List[SchedulingResult]:
+    """
+    Handle creating invites for multiple candidates.
+    Returns list of SchedulingResult for UI display.
+    """
+    results: List[SchedulingResult] = []
+
+    if scheduling_mode == "group" and len(candidates) > 1:
+        # Group interview: single invite with all candidates
+        result = _create_group_invite(
+            audit=audit,
+            selected_slot=selected_slot,
+            tz_name=tz_name,
+            candidate_timezone=candidate_timezone,
+            duration_minutes=duration_minutes,
+            role_title=role_title,
+            subject=subject,
+            agenda=agenda,
+            location=location,
+            is_teams=is_teams,
+            candidates=candidates,
+            hiring_manager=hiring_manager,
+            recruiter=recruiter,
+            include_recruiter=include_recruiter,
+            panel_interviewers=panel_interviewers,
+        )
+        results.append(result)
+    else:
+        # Individual interviews: one invite per candidate
+        for candidate in candidates:
+            if not candidate.is_valid:
+                results.append(SchedulingResult(
+                    candidate_email=candidate.original,
+                    candidate_name=candidate.name,
+                    success=False,
+                    event_id=None,
+                    teams_url=None,
+                    error=candidate.error or "Invalid candidate"
+                ))
+                continue
+
+            result = _create_individual_invite(
+                audit=audit,
+                selected_slot=selected_slot,
+                tz_name=tz_name,
+                candidate_timezone=candidate_timezone,
+                duration_minutes=duration_minutes,
+                role_title=role_title,
+                subject=subject,
+                agenda=agenda,
+                location=location,
+                is_teams=is_teams,
+                candidate=(candidate.email, candidate.name),
+                hiring_manager=hiring_manager,
+                recruiter=recruiter,
+                include_recruiter=include_recruiter,
+                panel_interviewers=panel_interviewers,
+            )
+            results.append(result)
+
+    return results
+
+
+def _create_individual_invite(
+    *,
+    audit: AuditLog,
+    selected_slot: Dict[str, str],
+    tz_name: str,
+    candidate_timezone: str,
+    duration_minutes: int,
+    role_title: str,
+    subject: str,
+    agenda: str,
+    location: str,
+    is_teams: bool,
+    candidate: Tuple[str, str],
+    hiring_manager: Tuple[str, str],
+    recruiter: Tuple[str, str],
+    include_recruiter: bool,
+    panel_interviewers: Optional[List[Dict[str, str]]] = None,
+) -> SchedulingResult:
+    """
+    Create a single individual interview invite.
+    Returns SchedulingResult with success/failure status.
+    """
+    candidate_email_raw, candidate_name = candidate
+    hm_email_raw, hm_name = hiring_manager
+    rec_email_raw, rec_name = recruiter
+
+    # === INPUT VALIDATION ===
+    if not is_valid_timezone(tz_name):
+        tz_name = "UTC"
+    if not is_valid_timezone(candidate_timezone):
+        candidate_timezone = tz_name
+
+    try:
+        candidate_email = validate_email(candidate_email_raw, "Candidate email")
+        hm_email = validate_email(hm_email_raw, "Hiring manager email")
+        rec_email = validate_email_optional(rec_email_raw, "Recruiter email")
+    except ValidationError as e:
+        return SchedulingResult(
+            candidate_email=candidate_email_raw,
+            candidate_name=candidate_name,
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error=e.message
+        )
+
+    try:
+        validate_slot(selected_slot)
+    except ValidationError as e:
+        return SchedulingResult(
+            candidate_email=candidate_email,
+            candidate_name=candidate_name,
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error=f"Invalid slot: {e.message}"
+        )
+
+    # Parse selected slot into a local datetime
+    try:
+        start_local_naive = datetime.fromisoformat(f"{selected_slot['date']}T{selected_slot['start']}:00")
+    except ValueError as e:
+        return SchedulingResult(
+            candidate_email=candidate_email,
+            candidate_name=candidate_name,
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error=f"Invalid date/time format: {e}"
+        )
+
+    zi, _ = safe_zoneinfo(tz_name, fallback="UTC")
+    start_local = start_local_naive.replace(tzinfo=zi)
+    end_local = start_local + timedelta(minutes=duration_minutes)
+    start_utc = to_utc(start_local)
+    end_utc = to_utc(end_local)
+
+    # Build attendees list
+    attendees: List[Tuple[str, str]] = [(candidate_email, candidate_name)]
+    is_panel = panel_interviewers and len(panel_interviewers) > 1
+    validated_panel: List[Dict[str, str]] = []
+
+    if panel_interviewers:
+        seen_emails = {candidate_email}
+        for pi in panel_interviewers:
+            pi_email = (pi.get("email") or "").strip().lower()
+            if pi_email and pi_email not in seen_emails:
+                try:
+                    validated_email = validate_email(pi_email, "Panel interviewer email")
+                    validated_panel.append({"name": pi.get("name", ""), "email": validated_email})
+                    attendees.append((validated_email, pi.get("name", "")))
+                    seen_emails.add(validated_email)
+                except ValidationError:
+                    pass
+    else:
+        attendees.append((hm_email, hm_name))
+
+    if include_recruiter and rec_email:
+        attendees.append((rec_email, rec_name))
+
+    organizer_email = str(get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"))
+    organizer_name = "PowerDash Scheduler"
+
+    effective_subject = subject
+    if is_panel:
+        if not subject.startswith("Panel Interview"):
+            effective_subject = f"Panel Interview: {role_title} - {candidate_name}"
+
+    # Generate ICS fallback
+    ics_bytes = _build_ics(
+        organizer_email=organizer_email,
+        organizer_name=organizer_name,
+        attendee_emails=[a[0] for a in attendees],
+        summary=effective_subject,
+        description=agenda,
+        dtstart_utc=start_utc,
+        dtend_utc=end_utc,
+        location=("Microsoft Teams" if is_teams else (location or "Interview")),
+        url="",
+        uid_hint=f"{role_title}|{candidate_email}|{hm_email}",
+        display_timezone=candidate_timezone,
+    )
+    st.session_state["last_invite_ics_bytes"] = ics_bytes
+    st.session_state["last_invite_uid"] = stable_uid(f"{role_title}|{candidate_email}|{hm_email}", organizer_email, start_utc.isoformat())
+
+    client = _make_graph_client()
+    if not client:
+        return SchedulingResult(
+            candidate_email=candidate_email,
+            candidate_name=candidate_name,
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error="Graph API not configured"
+        )
+
+    # Format time display for candidate's timezone
+    from timezone_utils import format_datetime_for_display
+    candidate_time_display = format_datetime_for_display(start_utc, candidate_timezone)
+
+    body_html = f"<p><strong>Interview Time (your timezone): {candidate_time_display}</strong></p>"
+    if is_panel and validated_panel:
+        body_html += "<p><strong>Interview Panel:</strong></p><ul>"
+        for pi in validated_panel:
+            name = pi.get("name") or pi.get("email", "")
+            body_html += f"<li>{name}</li>"
+        body_html += "</ul>"
+    if agenda:
+        body_html += f"<p>{agenda.replace(chr(10), '<br>')}</p>"
+
+    payload = _graph_event_payload(
+        subject=effective_subject,
+        body_html=body_html,
+        start_local=start_local,
+        end_local=end_local,
+        time_zone=candidate_timezone,
+        attendees=attendees,
+        is_teams=is_teams,
+        location=location,
+    )
+
+    try:
+        created = client.create_event(payload)
+        event_id = created.get("id", "")
+        teams_url = ""
+        if is_teams:
+            teams_url = (created.get("onlineMeeting") or {}).get("joinUrl") or ""
+
+        # Serialize panel interviewers for database storage
+        panel_json = ""
+        if validated_panel:
+            panel_json = json.dumps(validated_panel)
+
+        audit.upsert_interview(
+            role_title=role_title,
+            candidate_email=candidate_email,
+            hiring_manager_email=hm_email,
+            recruiter_email=rec_email or "",
+            duration_minutes=duration_minutes,
+            start_utc=iso_utc(start_utc),
+            end_utc=iso_utc(end_utc),
+            display_timezone=tz_name,
+            candidate_timezone=candidate_timezone,
+            graph_event_id=event_id,
+            teams_join_url=teams_url,
+            subject=effective_subject,
+            last_status="created",
+            panel_interviewers_json=panel_json,
+            is_panel_interview=is_panel,
+        )
+
+        audit.log(
+            "graph_create_event",
+            actor=rec_email or "",
+            candidate_email=candidate_email,
+            hiring_manager_email=hm_email,
+            recruiter_email=rec_email or "",
+            role_title=role_title,
+            event_id=event_id,
+            payload=payload,
+            status="success",
+        )
+
+        return SchedulingResult(
+            candidate_email=candidate_email,
+            candidate_name=candidate_name,
+            success=True,
+            event_id=event_id,
+            teams_url=teams_url,
+            error=None
+        )
+
+    except (GraphAuthError, GraphAPIError) as e:
+        details = getattr(e, "response_json", None)
+        audit.log(
+            "graph_create_failed",
+            actor=rec_email or "",
+            candidate_email=candidate_email,
+            hiring_manager_email=hm_email,
+            recruiter_email=rec_email or "",
+            role_title=role_title,
+            payload={"error": str(e), "details": details},
+            status="failed",
+            error_message=str(e),
+        )
+        return SchedulingResult(
+            candidate_email=candidate_email,
+            candidate_name=candidate_name,
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error=str(e)
+        )
+
+
+def _create_group_invite(
+    *,
+    audit: AuditLog,
+    selected_slot: Dict[str, str],
+    tz_name: str,
+    candidate_timezone: str,
+    duration_minutes: int,
+    role_title: str,
+    subject: str,
+    agenda: str,
+    location: str,
+    is_teams: bool,
+    candidates: List[CandidateValidationResult],
+    hiring_manager: Tuple[str, str],
+    recruiter: Tuple[str, str],
+    include_recruiter: bool,
+    panel_interviewers: Optional[List[Dict[str, str]]] = None,
+) -> SchedulingResult:
+    """
+    Create a single group interview invite with all candidates.
+    Returns SchedulingResult with success/failure status.
+    """
+    hm_email_raw, hm_name = hiring_manager
+    rec_email_raw, rec_name = recruiter
+
+    # === INPUT VALIDATION ===
+    if not is_valid_timezone(tz_name):
+        tz_name = "UTC"
+    if not is_valid_timezone(candidate_timezone):
+        candidate_timezone = tz_name
+
+    try:
+        hm_email = validate_email(hm_email_raw, "Hiring manager email")
+        rec_email = validate_email_optional(rec_email_raw, "Recruiter email")
+    except ValidationError as e:
+        return SchedulingResult(
+            candidate_email=", ".join(c.email or c.original for c in candidates),
+            candidate_name="Group",
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error=e.message
+        )
+
+    try:
+        validate_slot(selected_slot)
+    except ValidationError as e:
+        return SchedulingResult(
+            candidate_email=", ".join(c.email or c.original for c in candidates),
+            candidate_name="Group",
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error=f"Invalid slot: {e.message}"
+        )
+
+    # Parse selected slot into a local datetime
+    try:
+        start_local_naive = datetime.fromisoformat(f"{selected_slot['date']}T{selected_slot['start']}:00")
+    except ValueError as e:
+        return SchedulingResult(
+            candidate_email=", ".join(c.email or c.original for c in candidates),
+            candidate_name="Group",
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error=f"Invalid date/time format: {e}"
+        )
+
+    zi, _ = safe_zoneinfo(tz_name, fallback="UTC")
+    start_local = start_local_naive.replace(tzinfo=zi)
+    end_local = start_local + timedelta(minutes=duration_minutes)
+    start_utc = to_utc(start_local)
+    end_utc = to_utc(end_local)
+
+    # Build attendees list with all valid candidates
+    valid_candidates = [c for c in candidates if c.is_valid and c.email]
+    attendees: List[Tuple[str, str]] = [(c.email, c.name) for c in valid_candidates]
+
+    is_panel = panel_interviewers and len(panel_interviewers) > 1
+    validated_panel: List[Dict[str, str]] = []
+
+    if panel_interviewers:
+        seen_emails = {c.email for c in valid_candidates}
+        for pi in panel_interviewers:
+            pi_email = (pi.get("email") or "").strip().lower()
+            if pi_email and pi_email not in seen_emails:
+                try:
+                    validated_email = validate_email(pi_email, "Panel interviewer email")
+                    validated_panel.append({"name": pi.get("name", ""), "email": validated_email})
+                    attendees.append((validated_email, pi.get("name", "")))
+                    seen_emails.add(validated_email)
+                except ValidationError:
+                    pass
+    else:
+        attendees.append((hm_email, hm_name))
+
+    if include_recruiter and rec_email:
+        attendees.append((rec_email, rec_name))
+
+    organizer_email = str(get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"))
+    organizer_name = "PowerDash Scheduler"
+
+    # Use group interview subject
+    effective_subject = f"Group Interview: {role_title}"
+    if subject and not subject.startswith("Interview:"):
+        effective_subject = subject
+
+    # Build candidates JSON for storage
+    candidates_json = json.dumps([
+        {"email": c.email, "name": c.name} for c in valid_candidates
+    ])
+
+    # Generate ICS fallback
+    primary_candidate = valid_candidates[0] if valid_candidates else None
+    ics_bytes = _build_ics(
+        organizer_email=organizer_email,
+        organizer_name=organizer_name,
+        attendee_emails=[a[0] for a in attendees],
+        summary=effective_subject,
+        description=agenda,
+        dtstart_utc=start_utc,
+        dtend_utc=end_utc,
+        location=("Microsoft Teams" if is_teams else (location or "Interview")),
+        url="",
+        uid_hint=f"{role_title}|group|{hm_email}",
+        display_timezone=candidate_timezone,
+    )
+    st.session_state["last_invite_ics_bytes"] = ics_bytes
+    st.session_state["last_invite_uid"] = stable_uid(f"{role_title}|group|{hm_email}", organizer_email, start_utc.isoformat())
+
+    client = _make_graph_client()
+    if not client:
+        return SchedulingResult(
+            candidate_email=", ".join(c.email for c in valid_candidates),
+            candidate_name="Group",
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error="Graph API not configured"
+        )
+
+    # Format time display for candidate's timezone
+    from timezone_utils import format_datetime_for_display
+    candidate_time_display = format_datetime_for_display(start_utc, candidate_timezone)
+
+    body_html = f"<p><strong>Interview Time (your timezone): {candidate_time_display}</strong></p>"
+    body_html += f"<p><strong>Candidates ({len(valid_candidates)}):</strong></p><ul>"
+    for c in valid_candidates:
+        display = c.name if c.name else c.email
+        body_html += f"<li>{display}</li>"
+    body_html += "</ul>"
+
+    if is_panel and validated_panel:
+        body_html += "<p><strong>Interview Panel:</strong></p><ul>"
+        for pi in validated_panel:
+            name = pi.get("name") or pi.get("email", "")
+            body_html += f"<li>{name}</li>"
+        body_html += "</ul>"
+    if agenda:
+        body_html += f"<p>{agenda.replace(chr(10), '<br>')}</p>"
+
+    payload = _graph_event_payload(
+        subject=effective_subject,
+        body_html=body_html,
+        start_local=start_local,
+        end_local=end_local,
+        time_zone=candidate_timezone,
+        attendees=attendees,
+        is_teams=is_teams,
+        location=location,
+    )
+
+    try:
+        created = client.create_event(payload)
+        event_id = created.get("id", "")
+        teams_url = ""
+        if is_teams:
+            teams_url = (created.get("onlineMeeting") or {}).get("joinUrl") or ""
+
+        # Serialize panel interviewers for database storage
+        panel_json = ""
+        if validated_panel:
+            panel_json = json.dumps(validated_panel)
+
+        # Store with primary candidate email for backward compatibility
+        audit.upsert_interview(
+            role_title=role_title,
+            candidate_email=primary_candidate.email if primary_candidate else "",
+            hiring_manager_email=hm_email,
+            recruiter_email=rec_email or "",
+            duration_minutes=duration_minutes,
+            start_utc=iso_utc(start_utc),
+            end_utc=iso_utc(end_utc),
+            display_timezone=tz_name,
+            candidate_timezone=candidate_timezone,
+            graph_event_id=event_id,
+            teams_join_url=teams_url,
+            subject=effective_subject,
+            last_status="created",
+            panel_interviewers_json=panel_json,
+            is_panel_interview=is_panel,
+            candidates_json=candidates_json,
+            is_group_interview=True,
+        )
+
+        audit.log(
+            "graph_create_group_event",
+            actor=rec_email or "",
+            candidate_email=", ".join(c.email for c in valid_candidates),
+            hiring_manager_email=hm_email,
+            recruiter_email=rec_email or "",
+            role_title=role_title,
+            event_id=event_id,
+            payload={"candidates_count": len(valid_candidates)},
+            status="success",
+        )
+
+        return SchedulingResult(
+            candidate_email=", ".join(c.email for c in valid_candidates),
+            candidate_name=f"Group ({len(valid_candidates)} candidates)",
+            success=True,
+            event_id=event_id,
+            teams_url=teams_url,
+            error=None
+        )
+
+    except (GraphAuthError, GraphAPIError) as e:
+        details = getattr(e, "response_json", None)
+        audit.log(
+            "graph_create_group_failed",
+            actor=rec_email or "",
+            candidate_email=", ".join(c.email for c in valid_candidates),
+            hiring_manager_email=hm_email,
+            recruiter_email=rec_email or "",
+            role_title=role_title,
+            payload={"error": str(e), "details": details, "candidates_count": len(valid_candidates)},
+            status="failed",
+            error_message=str(e),
+        )
+        return SchedulingResult(
+            candidate_email=", ".join(c.email for c in valid_candidates),
+            candidate_name="Group",
+            success=False,
+            event_id=None,
+            teams_url=None,
+            error=str(e)
+        )
 
 
 def _handle_create_invite(

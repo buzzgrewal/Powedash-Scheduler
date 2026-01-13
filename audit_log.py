@@ -206,6 +206,30 @@ class AuditLog:
                         "Added is_panel_interview column to interviews table",
                         action="db_migration",
                     )
+
+                # Migration: Add candidates_json column for multi-candidate support
+                try:
+                    conn.execute("SELECT candidates_json FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN candidates_json TEXT")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added candidates_json column to interviews table",
+                        action="db_migration",
+                    )
+
+                # Migration: Add is_group_interview column for scheduling mode
+                try:
+                    conn.execute("SELECT is_group_interview FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN is_group_interview INTEGER DEFAULT 0")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added is_group_interview column to interviews table",
+                        action="db_migration",
+                    )
             finally:
                 conn.close()
         except sqlite3.Error as e:
@@ -321,6 +345,8 @@ class AuditLog:
         last_status: str,
         panel_interviewers_json: str = "",
         is_panel_interview: bool = False,
+        candidates_json: str = "",
+        is_group_interview: bool = False,
     ) -> bool:
         """
         Insert interview record. Returns True on success, False on failure.
@@ -329,6 +355,8 @@ class AuditLog:
             candidate_timezone: IANA timezone for the candidate (used for invitation display)
             panel_interviewers_json: JSON array of panel interviewer objects [{name, email}, ...]
             is_panel_interview: True if this is a panel interview with multiple interviewers
+            candidates_json: JSON array of candidate objects [{email, name}, ...] for multi-candidate
+            is_group_interview: True if all candidates are in a single group meeting
         """
         try:
             conn = self._connect()
@@ -339,8 +367,9 @@ class AuditLog:
                         created_utc, role_title, candidate_email, hiring_manager_email, recruiter_email,
                         duration_minutes, start_utc, end_utc, display_timezone, candidate_timezone,
                         graph_event_id, teams_join_url, subject, last_status,
-                        panel_interviewers_json, is_panel_interview
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        panel_interviewers_json, is_panel_interview,
+                        candidates_json, is_group_interview
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         utc_now_iso(),
@@ -359,6 +388,8 @@ class AuditLog:
                         last_status,
                         panel_interviewers_json,
                         1 if is_panel_interview else 0,
+                        candidates_json,
+                        1 if is_group_interview else 0,
                     ),
                 )
                 conn.commit()  # Explicit commit
