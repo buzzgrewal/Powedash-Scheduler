@@ -73,6 +73,21 @@ class SchedulingResult:
     error: Optional[str]
 
 
+@dataclass
+class CompanyConfig:
+    """Company branding configuration for emails."""
+    name: str
+    logo_url: Optional[str]
+    primary_color: str
+    website: Optional[str]
+    sender_email: str
+
+    @property
+    def signature_name(self) -> str:
+        """Return the company signature name for emails."""
+        return f"{self.name} Talent Acquisition Team"
+
+
 def validate_email(email: str, field_name: str = "email") -> str:
     """Validate email format. Returns cleaned email or raises ValidationError."""
     if not email:
@@ -251,6 +266,20 @@ def get_graph_config() -> Optional[GraphConfig]:
         client_id=str(client_id),
         client_secret=str(client_secret),
         scheduler_mailbox=str(scheduler_mailbox),
+    )
+
+
+def get_company_config() -> CompanyConfig:
+    """
+    Load company branding configuration from secrets.
+    Falls back to sensible defaults if not configured.
+    """
+    return CompanyConfig(
+        name=get_secret("company_name", "PowerDash HR"),
+        logo_url=get_secret("company_logo_url"),
+        primary_color=get_secret("company_primary_color", "#0066CC"),
+        website=get_secret("company_website"),
+        sender_email=get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"),
     )
 
 
@@ -889,6 +918,268 @@ Talent Acquisition
 """
 
 
+def _build_logo_html(company: CompanyConfig) -> str:
+    """Build logo HTML section, or empty string if no logo URL configured."""
+    if not company.logo_url:
+        return ""
+    return f'''
+    <tr>
+        <td align="center" style="padding: 20px 0 10px 0;">
+            <img src="{company.logo_url}" alt="{company.name}"
+                 style="max-height: 60px; max-width: 200px; height: auto; display: block;" />
+        </td>
+    </tr>
+    '''
+
+
+# System font stack for cross-platform email rendering
+_EMAIL_FONT_STACK = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+
+
+def build_branded_email_html(
+    candidate_name: str,
+    role_title: str,
+    slots: List[Dict[str, str]],
+    company: CompanyConfig,
+    custom_message: Optional[str] = None,
+) -> str:
+    """
+    Build professional HTML email with company branding.
+
+    Uses inline CSS only for email client compatibility.
+    Max width 600px, table-based layout.
+    """
+    # Logo section
+    logo_html = _build_logo_html(company)
+
+    # Greeting with candidate name
+    greeting = f"Dear {candidate_name}," if candidate_name else "Hello,"
+
+    # Optional custom message
+    custom_section = f'<p style="margin: 16px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">{custom_message}</p>' if custom_message else ""
+
+    # Build slot list HTML
+    slot_items = ""
+    for slot in slots:
+        slot_items += f'''
+        <tr>
+            <td style="padding: 10px 12px; border-left: 3px solid {company.primary_color};
+                       background-color: #f8f9fa; font-family: {_EMAIL_FONT_STACK}; font-size: 15px;">
+                {format_slot_label(slot)}
+            </td>
+        </tr>
+        <tr><td style="height: 8px;"></td></tr>
+        '''
+    if not slots:
+        slot_items = f'<tr><td style="padding: 10px 12px; color: #666; font-family: {_EMAIL_FONT_STACK};">(No slots available)</td></tr>'
+
+    # Website link for footer
+    website_link = ""
+    if company.website:
+        website_link = f'<p style="margin: 8px 0 0 0; font-size: 13px;"><a href="{company.website}" style="color: {company.primary_color}; text-decoration: none;">{company.website}</a></p>'
+
+    return f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f4f4;">
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color: #f4f4f4;">
+        <tr>
+            <td align="center" style="padding: 20px 10px;">
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0"
+                       style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                    {logo_html}
+                    <tr>
+                        <td style="padding: 32px 40px;">
+                            <p style="margin: 0 0 16px 0; color: #333333; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                {greeting}
+                            </p>
+                            <p style="margin: 0 0 16px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                Thank you for your interest in the <strong style="color: #333333;">{role_title}</strong> position at {company.name}.
+                            </p>
+                            {custom_section}
+                            <p style="margin: 0 0 8px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                Please select one of the following available interview times:
+                            </p>
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 16px 0;">
+                                {slot_items}
+                            </table>
+                            <p style="margin: 16px 0 0 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                Simply reply to this email with your preferred time slot, and we will send you a calendar invitation with all the details.
+                            </p>
+                        </td>
+                    </tr>
+                    <!-- Signature -->
+                    <tr>
+                        <td style="padding: 20px 40px; background-color: #f8f9fa; border-top: 1px solid #e9ecef; border-radius: 0 0 8px 8px;">
+                            <p style="margin: 0; color: #666666; font-family: {_EMAIL_FONT_STACK}; font-size: 14px;">
+                                Best regards,<br/>
+                                <strong style="color: {company.primary_color};">{company.signature_name}</strong>
+                            </p>
+                            {website_link}
+                        </td>
+                    </tr>
+                </table>
+                <!-- Footer -->
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="max-width: 600px; width: 100%;">
+                    <tr>
+                        <td style="padding: 16px 0; text-align: center;">
+                            <p style="margin: 0; font-family: {_EMAIL_FONT_STACK}; font-size: 12px; color: #999999;">
+                                This email was sent from {company.sender_email}
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>'''
+
+
+def build_confirmation_email_html(
+    candidate_name: str,
+    role_title: str,
+    interview_time: str,
+    teams_url: Optional[str],
+    interviewer_names: List[str],
+    company: CompanyConfig,
+) -> str:
+    """
+    Build confirmation email after candidate selects a slot.
+
+    Args:
+        candidate_name: Name of the candidate
+        role_title: Job title/role
+        interview_time: Formatted interview time in candidate's timezone
+        teams_url: Optional Microsoft Teams meeting URL
+        interviewer_names: List of interviewer names
+        company: Company branding configuration
+    """
+    logo_html = _build_logo_html(company)
+    greeting = f"Dear {candidate_name}," if candidate_name else "Hello,"
+
+    # Teams meeting section
+    meeting_section = ""
+    if teams_url:
+        meeting_section = f'''
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+               style="margin: 16px 0; background-color: #f0f7ff; border-left: 4px solid {company.primary_color}; border-radius: 4px;">
+            <tr>
+                <td style="padding: 16px;">
+                    <p style="margin: 0 0 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; font-weight: 600; color: #333333;">
+                        Microsoft Teams Meeting
+                    </p>
+                    <a href="{teams_url}" style="color: {company.primary_color}; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; word-break: break-all;">
+                        Join Meeting
+                    </a>
+                </td>
+            </tr>
+        </table>
+        '''
+
+    # Interviewers list
+    interviewers_html = ""
+    if interviewer_names:
+        names_list = ", ".join(interviewer_names)
+        interviewers_html = f'<p style="margin: 8px 0 0 0; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; color: #555555;"><strong>Interviewer(s):</strong> {names_list}</p>'
+
+    # Website link
+    website_link = ""
+    if company.website:
+        website_link = f'<p style="margin: 8px 0 0 0; font-size: 13px;"><a href="{company.website}" style="color: {company.primary_color}; text-decoration: none;">{company.website}</a></p>'
+
+    return f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f4f4;">
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color: #f4f4f4;">
+        <tr>
+            <td align="center" style="padding: 20px 10px;">
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0"
+                       style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                    {logo_html}
+                    <tr>
+                        <td style="padding: 32px 40px;">
+                            <p style="margin: 0 0 16px 0; color: #333333; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                {greeting}
+                            </p>
+                            <p style="margin: 0 0 16px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                Your interview for the <strong style="color: #333333;">{role_title}</strong> position at {company.name} has been confirmed.
+                            </p>
+                            <!-- Interview details box -->
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                                   style="margin: 16px 0; background-color: #f9f9f9; border-radius: 4px;">
+                                <tr>
+                                    <td style="padding: 16px;">
+                                        <p style="margin: 0; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; color: #333333;">
+                                            <strong>Date & Time:</strong> {interview_time}
+                                        </p>
+                                        {interviewers_html}
+                                    </td>
+                                </tr>
+                            </table>
+                            {meeting_section}
+                            <p style="margin: 16px 0 0 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                A calendar invitation has been sent to your email. If you need to reschedule, please reply to this email.
+                            </p>
+                        </td>
+                    </tr>
+                    <!-- Signature -->
+                    <tr>
+                        <td style="padding: 20px 40px; background-color: #f8f9fa; border-top: 1px solid #e9ecef; border-radius: 0 0 8px 8px;">
+                            <p style="margin: 0; color: #666666; font-family: {_EMAIL_FONT_STACK}; font-size: 14px;">
+                                Best regards,<br/>
+                                <strong style="color: {company.primary_color};">{company.signature_name}</strong>
+                            </p>
+                            {website_link}
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>'''
+
+
+def build_branded_email_plain(
+    candidate_name: str,
+    role_title: str,
+    slots: List[Dict[str, str]],
+    company: CompanyConfig,
+) -> str:
+    """Plain text version of branded email for fallback."""
+    greeting = f"Dear {candidate_name}," if candidate_name else "Hello,"
+    slot_lines = "\n".join([f"  - {format_slot_label(s)}" for s in slots]) if slots else "  - (No slots available)"
+
+    footer_parts = [company.signature_name]
+    if company.website:
+        footer_parts.append(company.website)
+
+    return f"""{greeting}
+
+Thank you for your interest in the {role_title} position at {company.name}.
+
+Please select one of the following available interview times:
+
+{slot_lines}
+
+Simply reply to this email with your preferred time slot, and we will send you a calendar invitation.
+
+Best regards,
+{chr(10).join(footer_parts)}
+
+---
+Sent from {company.sender_email}
+"""
+
+
 def _smtp_cfg() -> Optional[Dict[str, Any]]:
     # New keys (preferred)
     host = get_secret("smtp_host")
@@ -983,8 +1274,19 @@ def send_email_graph(
     to_emails: List[str],
     cc_emails: Optional[List[str]] = None,
     attachment: Optional[Dict[str, Any]] = None,
+    content_type: str = "Text",
 ) -> bool:
-    """Send email using Microsoft Graph API."""
+    """
+    Send email using Microsoft Graph API.
+
+    Args:
+        subject: Email subject line
+        body: Email body (plain text or HTML)
+        to_emails: List of recipient email addresses
+        cc_emails: Optional list of CC recipients
+        attachment: Optional attachment dict with filename, data, maintype, subtype
+        content_type: "Text" for plain text, "HTML" for HTML emails
+    """
     cfg = get_graph_config()
     if not cfg:
         st.warning("Graph is not configured. Add graph_tenant_id, graph_client_id, graph_client_secret, graph_scheduler_mailbox in Streamlit secrets.")
@@ -1004,7 +1306,7 @@ def send_email_graph(
             body=body,
             to_recipients=[e for e in to_emails if e],
             cc_recipients=[e for e in (cc_emails or []) if e] or None,
-            content_type="Text",
+            content_type=content_type,
             attachment=graph_attachment,
         )
         return True
@@ -1308,12 +1610,12 @@ def main() -> None:
             st.session_state["duration_minutes"] = st.number_input(
                 "Interview duration (minutes)", min_value=15, max_value=240, step=15, value=int(st.session_state["duration_minutes"])
             )
+            # Ensure selected_timezone is valid before widget renders
+            if st.session_state["selected_timezone"] not in _common_timezones():
+                st.session_state["selected_timezone"] = get_default_timezone()
             tz_name = st.selectbox(
                 "Display timezone",
                 options=_common_timezones(),
-                index=_common_timezones().index(st.session_state["selected_timezone"])
-                if st.session_state["selected_timezone"] in _common_timezones()
-                else 0,
                 key="selected_timezone",
             )
 
@@ -1600,19 +1902,50 @@ def main() -> None:
             st.markdown("----")
             st.markdown("#### Actions")
 
-            # Generate email to candidate (existing behavior)
+            # Generate branded email to candidate
             if st.button("Generate Candidate Scheduling Email"):
-                body = build_scheduling_email(role_title, recruiter_name or "Recruiter", st.session_state["slots"])
-                st.session_state["candidate_email_body"] = body
+                company = get_company_config()
+                html_body = build_branded_email_html(
+                    candidate_name=candidate_name,
+                    role_title=role_title or "Position",
+                    slots=st.session_state["slots"],
+                    company=company,
+                )
+                plain_body = build_branded_email_plain(
+                    candidate_name=candidate_name,
+                    role_title=role_title or "Position",
+                    slots=st.session_state["slots"],
+                    company=company,
+                )
+                st.session_state["candidate_email_html"] = html_body
+                st.session_state["candidate_email_plain"] = plain_body
 
-            if "candidate_email_body" in st.session_state and st.session_state["candidate_email_body"]:
-                st.text_area("Email preview", st.session_state["candidate_email_body"], height=200)
+            if st.session_state.get("candidate_email_html"):
+                # Preview mode toggle
+                preview_mode = st.radio(
+                    "Preview mode",
+                    options=["Rendered", "HTML Source", "Plain Text"],
+                    horizontal=True,
+                    key="email_preview_mode"
+                )
+
+                if preview_mode == "Rendered":
+                    st.markdown("**Email Preview (Rendered):**")
+                    import streamlit.components.v1 as components
+                    components.html(st.session_state["candidate_email_html"], height=500, scrolling=True)
+                elif preview_mode == "HTML Source":
+                    st.code(st.session_state["candidate_email_html"], language="html")
+                else:
+                    st.text_area("Email preview (Plain Text)", st.session_state["candidate_email_plain"], height=300)
+
+                company = get_company_config()
                 if st.button("Send Email"):
                     ok = send_email_graph(
-                        subject=f"Interview availability: {role_title}",
-                        body=st.session_state["candidate_email_body"],
+                        subject=f"Interview Opportunity at {company.name}: {role_title}",
+                        body=st.session_state["candidate_email_html"],
                         to_emails=[candidate_email] if candidate_email else [],
                         cc_emails=[recruiter_email] if recruiter_email else None,
+                        content_type="HTML",
                     )
                     audit.log(
                         "graph_sent_scheduling_email" if ok else "graph_send_failed",
@@ -1621,7 +1954,7 @@ def main() -> None:
                         hiring_manager_email=hiring_manager_email or "",
                         recruiter_email=recruiter_email or "",
                         role_title=role_title or "",
-                        payload={"subject": f"Interview availability: {role_title}"},
+                        payload={"subject": f"Interview Opportunity at {company.name}: {role_title}"},
                         status="success" if ok else "failed",
                         error_message="" if ok else "Graph email send failed",
                     )
