@@ -468,6 +468,12 @@ def ensure_session_state() -> None:
         "selected_timezone": get_default_timezone(),
         "candidate_timezone": get_default_timezone(),
         "duration_minutes": 30,
+        # Panel interview support
+        "panel_interviewers": [],  # List of {id, name, email, file, slots, timezone}
+        "next_interviewer_id": 1,  # Auto-increment for unique widget keys
+        "slot_filter_mode": "all_available",  # "all_available" | "any_n" | "show_all"
+        "slot_filter_min_n": 1,  # Minimum N for "any_n" mode
+        "computed_intersections": [],  # Intersection slots with availability metadata
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -844,12 +850,84 @@ def main() -> None:
             st.text_input("Recruiter / Scheduling Mailbox Email", value=str(scheduler_mailbox), disabled=True)
 
         with col_center:
-            st.markdown("#### Upload Availability")
-            upload = st.file_uploader(
-                "Free/busy screenshot (PDF, PNG, JPG, JPEG, DOCX)",
-                type=["pdf", "png", "jpg", "jpeg", "docx"],
-                key="availability_upload",
-            )
+            st.markdown("#### Interviewer Availability")
+
+            # Ensure at least one interviewer exists
+            if not st.session_state.get("panel_interviewers"):
+                new_id = st.session_state["next_interviewer_id"]
+                st.session_state["next_interviewer_id"] = new_id + 1
+                st.session_state["panel_interviewers"] = [{
+                    "id": new_id,
+                    "name": "",
+                    "email": "",
+                    "file": None,
+                    "slots": [],
+                    "timezone": st.session_state["selected_timezone"],
+                }]
+
+            interviewers = st.session_state["panel_interviewers"]
+
+            # Render each interviewer
+            for idx, interviewer in enumerate(interviewers):
+                with st.container(border=True):
+                    cols = st.columns([3, 3, 1])
+                    with cols[0]:
+                        name = st.text_input(
+                            "Name",
+                            value=interviewer.get("name", ""),
+                            key=f"interviewer_name_{interviewer['id']}",
+                            placeholder="e.g., John Smith"
+                        )
+                        interviewers[idx]["name"] = name
+                    with cols[1]:
+                        email = st.text_input(
+                            "Email",
+                            value=interviewer.get("email", ""),
+                            key=f"interviewer_email_{interviewer['id']}",
+                            placeholder="john@company.com"
+                        )
+                        interviewers[idx]["email"] = email
+                    with cols[2]:
+                        st.write("")  # Spacing
+                        # Remove button (disabled if only 1 interviewer)
+                        if len(interviewers) > 1:
+                            if st.button("Remove", key=f"remove_{interviewer['id']}"):
+                                st.session_state["panel_interviewers"] = [
+                                    i for i in interviewers if i["id"] != interviewer["id"]
+                                ]
+                                st.rerun()
+
+                    # File uploader
+                    uploaded = st.file_uploader(
+                        f"Calendar ({interviewer.get('name') or f'Interviewer {idx+1}'})",
+                        type=["pdf", "png", "jpg", "jpeg", "docx"],
+                        key=f"file_{interviewer['id']}",
+                    )
+                    interviewers[idx]["file"] = uploaded
+
+                    # Show slot count after parsing
+                    slot_count = len(interviewer.get("slots", []))
+                    if slot_count > 0:
+                        st.caption(f"Parsed {slot_count} slot(s)")
+
+            st.session_state["panel_interviewers"] = interviewers
+
+            # Add interviewer button
+            if st.button("+ Add Interviewer", key="add_interviewer_btn"):
+                new_id = st.session_state["next_interviewer_id"]
+                st.session_state["next_interviewer_id"] = new_id + 1
+                st.session_state["panel_interviewers"].append({
+                    "id": new_id,
+                    "name": "",
+                    "email": "",
+                    "file": None,
+                    "slots": [],
+                    "timezone": st.session_state["selected_timezone"],
+                })
+                st.rerun()
+
+            st.markdown("---")
+
             st.session_state["duration_minutes"] = st.number_input(
                 "Interview duration (minutes)", min_value=15, max_value=240, step=15, value=int(st.session_state["duration_minutes"])
             )
@@ -873,83 +951,158 @@ def main() -> None:
                 selected_time = now_selected.strftime("%I:%M %p %Z")
                 system_time = now_system.strftime("%I:%M %p %Z")
 
-                st.caption(f"🕐 **{tz_name}**: {selected_time} | **Your system ({system_tz_name})**: {system_time}")
+                st.caption(f"**{tz_name}**: {selected_time} | **Your system ({system_tz_name})**: {system_time}")
             except:
                 pass
 
-            parse_btn = st.button("Parse Availability", type="primary")
+            parse_btn = st.button("Parse All Availability", type="primary")
 
-            if parse_btn and upload is not None:
-                slots = _parse_availability_upload(upload)
-                st.session_state["slots"] = slots
-                st.success(f"Extracted {len(slots)} slot(s).")
+            if parse_btn:
+                _parse_all_panel_availability()
 
-            st.markdown("#### Extracted Slots")
+            st.markdown("#### Available Time Slots")
+
+            intersections = st.session_state.get("computed_intersections", [])
+            panel_interviewers = st.session_state.get("panel_interviewers", [])
+            interviewer_count = len([i for i in panel_interviewers if i.get("slots")])
+
             if st.session_state["slots"]:
-                st.info("Select a slot to create an invite, or generate a candidate email.")
-                slot_labels = [format_slot_label(s) for s in st.session_state["slots"]]
-                selected_label = st.selectbox("Select slot", options=slot_labels, key="selected_slot_label")
-                selected_slot = st.session_state["slots"][slot_labels.index(selected_label)]
+                # Filter mode selector (only show if multiple interviewers)
+                if interviewer_count > 1:
+                    from slot_intersection import filter_slots_by_availability
 
-                # Real-time timezone conversion preview
-                if selected_slot:
-                    from timezone_utils import safe_zoneinfo, from_utc, format_time_for_display
-                    try:
-                        # Parse the slot time as display timezone
-                        slot_dt_naive = datetime.strptime(
-                            f"{selected_slot['date']}T{selected_slot['start']}:00",
-                            "%Y-%m-%dT%H:%M:%S"
+                    filter_col1, filter_col2 = st.columns([2, 1])
+                    with filter_col1:
+                        filter_options = [
+                            ("all_available", f"All {interviewer_count} must be available"),
+                            ("any_n", "At least N are available"),
+                            ("show_all", "Show all slots"),
+                        ]
+                        filter_mode = st.selectbox(
+                            "Show slots where:",
+                            options=filter_options,
+                            format_func=lambda x: x[1],
+                            key="slot_filter_mode_select"
                         )
-                        zi, _ = safe_zoneinfo(tz_name, fallback="UTC")
-                        slot_dt_local = slot_dt_naive.replace(tzinfo=zi)
+                        st.session_state["slot_filter_mode"] = filter_mode[0]
 
-                        # Convert to UTC for reference
-                        from timezone_utils import to_utc
-                        slot_utc = to_utc(slot_dt_local)
-
-                        # Show conversion to common timezones
-                        st.markdown("**Time Conversion Preview:**")
-                        preview_tzs = ["UTC", "America/New_York", "America/Los_Angeles", "Europe/London", "Asia/Tokyo"]
-                        # Add display timezone if not in list
-                        if tz_name not in preview_tzs:
-                            preview_tzs.insert(0, tz_name)
-
-                        conversion_items = []
-                        for preview_tz in preview_tzs:
-                            try:
-                                converted = from_utc(slot_utc, preview_tz)
-                                time_str = converted.strftime("%a %b %d, %I:%M %p %Z")
-                                # Highlight the display timezone
-                                if preview_tz == tz_name:
-                                    conversion_items.append(f"**{preview_tz}**: {time_str} *(selected)*")
-                                else:
-                                    conversion_items.append(f"{preview_tz}: {time_str}")
-                            except Exception:
-                                pass
-
-                        st.caption(" | ".join(conversion_items[:4]))  # Show top 4
-                    except (ValueError, TypeError):
-                        pass  # Skip preview on invalid date
-
-                # DST Warning Check
-                if selected_slot:
-                    from timezone_utils import is_near_dst_transition
-                    try:
-                        slot_date = datetime.strptime(selected_slot["date"], "%Y-%m-%d").date()
-                        slot_dt = datetime.combine(slot_date, datetime.min.time())
-
-                        # Check display timezone for DST transition
-                        is_near, trans_date, trans_type = is_near_dst_transition(slot_dt, tz_name, days_threshold=7)
-                        if is_near and trans_date:
-                            direction = "spring forward" if trans_type == "spring_forward" else "fall back"
-                            st.warning(
-                                f"DST Alert: Clocks {direction} on {trans_date.strftime('%B %d, %Y')} "
-                                f"in {tz_name}. Please verify the scheduled time."
+                    with filter_col2:
+                        if filter_mode[0] == "any_n":
+                            min_n = st.number_input(
+                                "Minimum N",
+                                min_value=1,
+                                max_value=interviewer_count,
+                                value=max(1, interviewer_count - 1),
+                                key="slot_filter_min_n_input"
                             )
-                    except (ValueError, TypeError):
-                        pass  # Skip DST check on invalid date
+                            st.session_state["slot_filter_min_n"] = min_n
+
+                    # Apply filter
+                    filtered_slots = filter_slots_by_availability(
+                        intersections,
+                        st.session_state.get("slot_filter_mode", "all_available"),
+                        st.session_state.get("slot_filter_min_n", 1),
+                        interviewer_count
+                    )
+                else:
+                    filtered_slots = st.session_state["slots"]
+
+                if not filtered_slots:
+                    st.warning("No slots match the current filter. Try relaxing the availability requirement.")
+                    selected_slot = None
+                else:
+                    st.info("Select a slot to create an invite, or generate a candidate email.")
+
+                    # Build slot labels with availability info
+                    from slot_intersection import format_slot_label_with_availability
+
+                    def get_slot_label(slot):
+                        if interviewer_count > 1:
+                            return format_slot_label_with_availability(slot, interviewer_count)
+                        return format_slot_label(slot)
+
+                    slot_labels = [get_slot_label(s) for s in filtered_slots]
+                    selected_label = st.selectbox("Select slot", options=slot_labels, key="selected_slot_label")
+                    selected_slot = filtered_slots[slot_labels.index(selected_label)]
+
+                    # Show availability indicator for panel interviews
+                    if interviewer_count > 1 and selected_slot:
+                        avail = selected_slot.get("available_count", interviewer_count)
+                        total = selected_slot.get("total_interviewers", interviewer_count)
+                        available_names = selected_slot.get("available_names", [])
+
+                        if avail == total:
+                            st.success(f"All {total} interviewers available")
+                        elif avail >= total * 0.75:
+                            missing = [
+                                i.get("name") or i.get("email")
+                                for i in panel_interviewers
+                                if i["id"] not in selected_slot.get("available_interviewers", [])
+                                and i.get("slots")
+                            ]
+                            st.info(f"{avail}/{total} available. Missing: {', '.join(missing) if missing else 'None'}")
+                        else:
+                            st.warning(f"Only {avail}/{total} interviewers available: {', '.join(available_names)}")
+
+                    # Real-time timezone conversion preview
+                    if selected_slot:
+                        from timezone_utils import safe_zoneinfo, from_utc, format_time_for_display
+                        try:
+                            # Parse the slot time as display timezone
+                            slot_dt_naive = datetime.strptime(
+                                f"{selected_slot['date']}T{selected_slot['start']}:00",
+                                "%Y-%m-%dT%H:%M:%S"
+                            )
+                            zi, _ = safe_zoneinfo(tz_name, fallback="UTC")
+                            slot_dt_local = slot_dt_naive.replace(tzinfo=zi)
+
+                            # Convert to UTC for reference
+                            from timezone_utils import to_utc
+                            slot_utc = to_utc(slot_dt_local)
+
+                            # Show conversion to common timezones
+                            st.markdown("**Time Conversion Preview:**")
+                            preview_tzs = ["UTC", "America/New_York", "America/Los_Angeles", "Europe/London", "Asia/Tokyo"]
+                            # Add display timezone if not in list
+                            if tz_name not in preview_tzs:
+                                preview_tzs.insert(0, tz_name)
+
+                            conversion_items = []
+                            for preview_tz in preview_tzs:
+                                try:
+                                    converted = from_utc(slot_utc, preview_tz)
+                                    time_str = converted.strftime("%a %b %d, %I:%M %p %Z")
+                                    # Highlight the display timezone
+                                    if preview_tz == tz_name:
+                                        conversion_items.append(f"**{preview_tz}**: {time_str} *(selected)*")
+                                    else:
+                                        conversion_items.append(f"{preview_tz}: {time_str}")
+                                except Exception:
+                                    pass
+
+                            st.caption(" | ".join(conversion_items[:4]))  # Show top 4
+                        except (ValueError, TypeError):
+                            pass  # Skip preview on invalid date
+
+                    # DST Warning Check
+                    if selected_slot:
+                        from timezone_utils import is_near_dst_transition
+                        try:
+                            slot_date = datetime.strptime(selected_slot["date"], "%Y-%m-%d").date()
+                            slot_dt = datetime.combine(slot_date, datetime.min.time())
+
+                            # Check display timezone for DST transition
+                            is_near, trans_date, trans_type = is_near_dst_transition(slot_dt, tz_name, days_threshold=7)
+                            if is_near and trans_date:
+                                direction = "spring forward" if trans_type == "spring_forward" else "fall back"
+                                st.warning(
+                                    f"DST Alert: Clocks {direction} on {trans_date.strftime('%B %d, %Y')} "
+                                    f"in {tz_name}. Please verify the scheduled time."
+                                )
+                        except (ValueError, TypeError):
+                            pass  # Skip DST check on invalid date
             else:
-                st.info("No slots extracted yet. Upload a calendar view and click Parse Availability.")
+                st.info("No slots extracted yet. Upload availability and click Parse All Availability.")
                 selected_slot = None
 
         with col_right:
@@ -1037,7 +1190,16 @@ def main() -> None:
                         st.error("Email send failed (see message above).")
 
             # Create Graph event
-            create_disabled = not (selected_slot and hiring_manager_email and candidate_email)
+            # Collect panel interviewers from session state
+            panel_interviewers_for_invite = [
+                {"name": i.get("name", ""), "email": i.get("email", "")}
+                for i in st.session_state.get("panel_interviewers", [])
+                if i.get("email")  # Only include interviewers with valid emails
+            ]
+
+            # Determine if we have enough info to create invite
+            has_interviewers = bool(panel_interviewers_for_invite) or bool(hiring_manager_email)
+            create_disabled = not (selected_slot and has_interviewers and candidate_email)
             if st.button("Create & Send Interview Invite", disabled=create_disabled):
                 _handle_create_invite(
                     audit=audit,
@@ -1054,6 +1216,7 @@ def main() -> None:
                     hiring_manager=(hiring_manager_email, hiring_manager_name),
                     recruiter=(recruiter_email, recruiter_name),
                     include_recruiter=include_recruiter,
+                    panel_interviewers=panel_interviewers_for_invite if panel_interviewers_for_invite else None,
                 )
 
             # ICS fallback download button (available after generation)
@@ -1314,6 +1477,78 @@ def _parse_availability_upload(upload) -> List[Dict[str, str]]:
     return list(uniq.values())
 
 
+def _parse_all_panel_availability() -> None:
+    """Parse availability for all interviewers and compute intersection."""
+    from slot_intersection import (
+        normalize_slots_to_utc,
+        merge_adjacent_slots,
+        compute_intersection,
+    )
+
+    interviewers = st.session_state.get("panel_interviewers", [])
+    tz_name = st.session_state["selected_timezone"]
+    min_duration = st.session_state["duration_minutes"]
+
+    all_interviewer_slots: Dict[int, List] = {}
+    interviewer_names: Dict[int, str] = {}
+    parse_errors = []
+    total_parsed = 0
+
+    for interviewer in interviewers:
+        if not interviewer.get("file"):
+            continue
+
+        try:
+            # Reset file position before reading
+            interviewer["file"].seek(0)
+            # Parse the uploaded file
+            slots = _parse_availability_upload(interviewer["file"])
+            interviewer["slots"] = slots
+            total_parsed += len(slots)
+
+            # Build interviewer name for display
+            name = interviewer.get("name") or interviewer.get("email") or f"Interviewer {interviewer['id']}"
+            interviewer_names[interviewer["id"]] = name
+
+            # Normalize to UTC for intersection
+            if slots:
+                normalized = normalize_slots_to_utc(slots, tz_name)
+                merged = merge_adjacent_slots(normalized)
+                all_interviewer_slots[interviewer["id"]] = merged
+        except Exception as e:
+            interviewer_name = interviewer.get("name") or f"Interviewer {interviewer.get('id', '?')}"
+            parse_errors.append(f"{interviewer_name}: {e}")
+
+    if parse_errors:
+        for err in parse_errors:
+            st.error(err)
+
+    # Compute intersection
+    if all_interviewer_slots:
+        intersections = compute_intersection(
+            all_interviewer_slots,
+            min_duration_minutes=min_duration,
+            display_timezone=tz_name,
+            interviewer_names=interviewer_names,
+        )
+        st.session_state["computed_intersections"] = intersections
+
+        # Also update legacy "slots" for backward compatibility
+        st.session_state["slots"] = intersections
+
+        num_interviewers = len(all_interviewer_slots)
+        if num_interviewers == 1:
+            st.success(f"Extracted {total_parsed} slot(s) from 1 interviewer.")
+        else:
+            full_overlap = sum(1 for s in intersections if s.get("is_full_overlap", False))
+            st.success(
+                f"Parsed {total_parsed} total slots from {num_interviewers} interviewers. "
+                f"Found {len(intersections)} intersection slot(s) ({full_overlap} with all available)."
+            )
+    else:
+        st.warning("No availability files uploaded. Please upload at least one calendar.")
+
+
 def _zoneinfo(tz_name: str):
     """Get ZoneInfo with validation. Falls back to UTC if invalid."""
     zi, was_valid = safe_zoneinfo(tz_name, fallback="UTC")
@@ -1368,6 +1603,7 @@ def _handle_create_invite(
     hiring_manager: Tuple[str, str],
     recruiter: Tuple[str, str],
     include_recruiter: bool,
+    panel_interviewers: Optional[List[Dict[str, str]]] = None,
 ) -> None:
     candidate_email_raw, candidate_name = candidate
     hm_email_raw, hm_name = hiring_manager
@@ -1430,19 +1666,46 @@ def _handle_create_invite(
         if not st.checkbox("Create duplicate anyway?", key=checkbox_key):
             return
 
-    attendees: List[Tuple[str, str]] = [(candidate_email, candidate_name), (hm_email, hm_name)]
+    attendees: List[Tuple[str, str]] = [(candidate_email, candidate_name)]
+
+    # Build attendees from panel interviewers if provided, otherwise use hiring manager
+    is_panel = panel_interviewers and len(panel_interviewers) > 1
+    validated_panel: List[Dict[str, str]] = []
+
+    if panel_interviewers:
+        seen_emails = {candidate_email}  # Avoid duplicating candidate
+        for pi in panel_interviewers:
+            pi_email = (pi.get("email") or "").strip().lower()
+            if pi_email and pi_email not in seen_emails:
+                try:
+                    validated_email = validate_email(pi_email, "Panel interviewer email")
+                    validated_panel.append({"name": pi.get("name", ""), "email": validated_email})
+                    attendees.append((validated_email, pi.get("name", "")))
+                    seen_emails.add(validated_email)
+                except ValidationError:
+                    pass  # Skip invalid emails
+    else:
+        # Fall back to single hiring manager (backward compatibility)
+        attendees.append((hm_email, hm_name))
+
     if include_recruiter and rec_email:
         attendees.append((rec_email, rec_name))
 
     organizer_email = str(get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"))
     organizer_name = "PowerDash Scheduler"
 
+    # Update subject for panel interviews
+    effective_subject = subject
+    if is_panel:
+        if not subject.startswith("Panel Interview"):
+            effective_subject = f"Panel Interview: {role_title} - {candidate_name}"
+
     # Always generate ICS (so we have a fallback even if Graph works)
     ics_bytes = _build_ics(
         organizer_email=organizer_email,
         organizer_name=organizer_name,
         attendee_emails=[a[0] for a in attendees],
-        summary=subject,
+        summary=effective_subject,
         description=agenda,
         dtstart_utc=start_utc,
         dtend_utc=end_utc,
@@ -1475,11 +1738,20 @@ def _handle_create_invite(
 
     # Build body with candidate-friendly time display
     body_html = f"<p><strong>Interview Time (your timezone): {candidate_time_display}</strong></p>"
+
+    # Add panel members to body if panel interview
+    if is_panel and validated_panel:
+        body_html += "<p><strong>Interview Panel:</strong></p><ul>"
+        for pi in validated_panel:
+            name = pi.get("name") or pi.get("email", "")
+            body_html += f"<li>{name}</li>"
+        body_html += "</ul>"
+
     if agenda:
         body_html += f"<p>{agenda.replace(chr(10), '<br>')}</p>"
 
     payload = _graph_event_payload(
-        subject=subject,
+        subject=effective_subject,
         body_html=body_html,
         start_local=start_local,
         end_local=end_local,
@@ -1504,7 +1776,7 @@ def _handle_create_invite(
                 organizer_email=organizer_email,
                 organizer_name=organizer_name,
                 attendee_emails=[a[0] for a in attendees],
-                summary=subject,
+                summary=effective_subject,
                 description=agenda,
                 dtstart_utc=start_utc,
                 dtend_utc=end_utc,
@@ -1525,6 +1797,13 @@ def _handle_create_invite(
             payload=payload,
             status="success",
         )
+
+        # Serialize panel interviewers for database storage
+        panel_json = ""
+        if validated_panel:
+            import json as _json
+            panel_json = _json.dumps(validated_panel)
+
         audit.upsert_interview(
             role_title=role_title,
             candidate_email=candidate_email,
@@ -1537,8 +1816,10 @@ def _handle_create_invite(
             candidate_timezone=candidate_timezone,
             graph_event_id=event_id,
             teams_join_url=teams_url,
-            subject=subject,
+            subject=effective_subject,
             last_status="created",
+            panel_interviewers_json=panel_json,
+            is_panel_interview=is_panel,
         )
 
         st.success("Invite created and sent via Microsoft Graph.")

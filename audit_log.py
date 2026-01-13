@@ -182,6 +182,30 @@ class AuditLog:
                         "Added candidate_timezone column to interviews table",
                         action="db_migration",
                     )
+
+                # Migration: Add panel_interviewers_json column if missing
+                try:
+                    conn.execute("SELECT panel_interviewers_json FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN panel_interviewers_json TEXT")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added panel_interviewers_json column to interviews table",
+                        action="db_migration",
+                    )
+
+                # Migration: Add is_panel_interview column if missing
+                try:
+                    conn.execute("SELECT is_panel_interview FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN is_panel_interview INTEGER DEFAULT 0")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added is_panel_interview column to interviews table",
+                        action="db_migration",
+                    )
             finally:
                 conn.close()
         except sqlite3.Error as e:
@@ -295,12 +319,16 @@ class AuditLog:
         teams_join_url: str,
         subject: str,
         last_status: str,
+        panel_interviewers_json: str = "",
+        is_panel_interview: bool = False,
     ) -> bool:
         """
         Insert interview record. Returns True on success, False on failure.
 
         Args:
             candidate_timezone: IANA timezone for the candidate (used for invitation display)
+            panel_interviewers_json: JSON array of panel interviewer objects [{name, email}, ...]
+            is_panel_interview: True if this is a panel interview with multiple interviewers
         """
         try:
             conn = self._connect()
@@ -310,8 +338,9 @@ class AuditLog:
                     INSERT INTO interviews (
                         created_utc, role_title, candidate_email, hiring_manager_email, recruiter_email,
                         duration_minutes, start_utc, end_utc, display_timezone, candidate_timezone,
-                        graph_event_id, teams_join_url, subject, last_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        graph_event_id, teams_join_url, subject, last_status,
+                        panel_interviewers_json, is_panel_interview
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         utc_now_iso(),
@@ -328,6 +357,8 @@ class AuditLog:
                         teams_join_url,
                         subject,
                         last_status,
+                        panel_interviewers_json,
+                        1 if is_panel_interview else 0,
                     ),
                 )
                 conn.commit()  # Explicit commit
