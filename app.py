@@ -6,7 +6,7 @@ import re
 import uuid
 import smtplib
 from email.message import EmailMessage
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date, time
 from typing import List, Dict, Any, Optional, Tuple
 
 import fitz  # PyMuPDF
@@ -474,6 +474,7 @@ def ensure_session_state() -> None:
         "slot_filter_mode": "all_available",  # "all_available" | "any_n" | "show_all"
         "slot_filter_min_n": 1,  # Minimum N for "any_n" mode
         "computed_intersections": [],  # Intersection slots with availability metadata
+        "editing_slot_index": None,  # Track which slot is being edited: (interviewer_idx, slot_idx) or None
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -482,6 +483,237 @@ def ensure_session_state() -> None:
 
 def format_slot_label(slot: Dict[str, str]) -> str:
     return f"{slot['date']} {slot['start']}–{slot['end']}"
+
+
+def _merge_slots(manual_slots: List[Dict], uploaded_slots: List[Dict]) -> List[Dict]:
+    """Merge slots, preferring manual over uploaded for duplicates."""
+    seen = {}
+    for s in manual_slots:
+        key = (s["date"], s["start"], s["end"])
+        seen[key] = s
+    for s in uploaded_slots:
+        key = (s["date"], s["start"], s["end"])
+        if key not in seen:
+            seen[key] = s
+    return list(seen.values())
+
+
+def _add_manual_slot(interviewer_idx: int, slot_date, start_time, end_time) -> bool:
+    """Add a manually entered slot with validation. Returns True if successful."""
+    from datetime import date as date_type, time as time_type
+
+    errors = []
+
+    # Validate end time is after start time
+    if end_time <= start_time:
+        errors.append("End time must be after start time")
+
+    # Validate minimum duration (30 minutes)
+    start_dt = datetime.combine(date.today(), start_time)
+    end_dt = datetime.combine(date.today(), end_time)
+    duration_minutes = (end_dt - start_dt).seconds // 60
+    if duration_minutes < 30:
+        errors.append("Slot must be at least 30 minutes")
+
+    # Validate not in the past
+    if slot_date < date.today():
+        errors.append("Cannot add slots in the past")
+
+    if errors:
+        for err in errors:
+            st.error(err)
+        return False
+
+    # Create slot in standard format
+    new_slot = {
+        "date": slot_date.strftime("%Y-%m-%d"),
+        "start": start_time.strftime("%H:%M"),
+        "end": end_time.strftime("%H:%M"),
+        "source": "manual",
+    }
+
+    # Get existing slots for this interviewer
+    interviewers = st.session_state.get("panel_interviewers", [])
+    if interviewer_idx >= len(interviewers):
+        st.error("Invalid interviewer index")
+        return False
+
+    existing_slots = interviewers[interviewer_idx].get("slots", [])
+
+    # Check for duplicates
+    slot_key = (new_slot["date"], new_slot["start"], new_slot["end"])
+    for s in existing_slots:
+        if (s["date"], s["start"], s["end"]) == slot_key:
+            st.warning("This slot already exists")
+            return False
+
+    existing_slots.append(new_slot)
+    st.session_state["panel_interviewers"][interviewer_idx]["slots"] = existing_slots
+    st.success(f"Added slot: {format_slot_label(new_slot)}")
+    return True
+
+
+def _delete_interviewer_slot(interviewer_idx: int, slot_idx: int) -> None:
+    """Delete a slot by index from an interviewer's slots."""
+    interviewers = st.session_state.get("panel_interviewers", [])
+    if interviewer_idx >= len(interviewers):
+        return
+
+    slots = interviewers[interviewer_idx].get("slots", [])
+    if 0 <= slot_idx < len(slots):
+        deleted = slots.pop(slot_idx)
+        st.session_state["panel_interviewers"][interviewer_idx]["slots"] = slots
+        st.toast(f"Deleted: {format_slot_label(deleted)}")
+        st.rerun()
+
+
+def _render_interviewer_slots(interviewer_idx: int, interviewer_id: int) -> None:
+    """Render editable list of current slots for an interviewer."""
+    interviewers = st.session_state.get("panel_interviewers", [])
+    if interviewer_idx >= len(interviewers):
+        return
+
+    slots = interviewers[interviewer_idx].get("slots", [])
+
+    if not slots:
+        st.info("No slots added yet. Use the form above or upload a calendar.")
+        return
+
+    st.markdown(f"**Current Slots ({len(slots)}):**")
+
+    for idx, slot in enumerate(slots):
+        col_label, col_edit, col_delete = st.columns([4, 1, 1])
+
+        with col_label:
+            source_badge = " manual" if slot.get("source") == "manual" else " uploaded"
+            st.text(f"{source_badge} {format_slot_label(slot)}")
+
+        with col_edit:
+            if st.button("Edit", key=f"edit_slot_{interviewer_id}_{idx}"):
+                st.session_state["editing_slot_index"] = (interviewer_idx, idx)
+                st.rerun()
+
+        with col_delete:
+            if st.button("Del", key=f"del_slot_{interviewer_id}_{idx}"):
+                _delete_interviewer_slot(interviewer_idx, idx)
+
+    # Clear all button
+    if len(slots) > 1:
+        if st.button("Clear All Slots", key=f"clear_all_{interviewer_id}", type="secondary"):
+            st.session_state["panel_interviewers"][interviewer_idx]["slots"] = []
+            st.rerun()
+
+
+def _render_manual_slot_form(interviewer_idx: int, interviewer_id: int) -> None:
+    """Render the form to add a new manual slot."""
+    st.caption("Add availability slots manually instead of uploading a calendar")
+
+    col_date, col_start, col_end, col_btn = st.columns([2, 1.5, 1.5, 1])
+
+    with col_date:
+        slot_date = st.date_input(
+            "Date",
+            value=date.today(),
+            key=f"manual_slot_date_{interviewer_id}",
+            min_value=date.today(),
+        )
+    with col_start:
+        slot_start = st.time_input(
+            "Start",
+            value=time(9, 0),
+            key=f"manual_slot_start_{interviewer_id}",
+        )
+    with col_end:
+        slot_end = st.time_input(
+            "End",
+            value=time(10, 0),
+            key=f"manual_slot_end_{interviewer_id}",
+        )
+    with col_btn:
+        st.write("")  # Vertical spacing
+        if st.button("+ Add", key=f"add_manual_slot_{interviewer_id}", type="primary"):
+            if _add_manual_slot(interviewer_idx, slot_date, slot_start, slot_end):
+                st.rerun()
+
+
+def _render_edit_slot_form(interviewer_idx: int, interviewer_id: int) -> None:
+    """Render edit form when a slot is being edited."""
+    edit_info = st.session_state.get("editing_slot_index")
+    if edit_info is None:
+        return
+
+    edit_interviewer_idx, edit_slot_idx = edit_info
+
+    # Only render if this is the interviewer being edited
+    if edit_interviewer_idx != interviewer_idx:
+        return
+
+    interviewers = st.session_state.get("panel_interviewers", [])
+    if interviewer_idx >= len(interviewers):
+        st.session_state["editing_slot_index"] = None
+        return
+
+    slots = interviewers[interviewer_idx].get("slots", [])
+    if edit_slot_idx >= len(slots):
+        st.session_state["editing_slot_index"] = None
+        return
+
+    slot = slots[edit_slot_idx]
+
+    st.markdown("---")
+    st.markdown(f"**Editing:** {format_slot_label(slot)}")
+
+    col_date, col_start, col_end = st.columns(3)
+    with col_date:
+        new_date = st.date_input(
+            "Date",
+            value=datetime.strptime(slot["date"], "%Y-%m-%d").date(),
+            key=f"edit_slot_date_{interviewer_id}",
+        )
+    with col_start:
+        new_start = st.time_input(
+            "Start",
+            value=datetime.strptime(slot["start"], "%H:%M").time(),
+            key=f"edit_slot_start_{interviewer_id}",
+        )
+    with col_end:
+        new_end = st.time_input(
+            "End",
+            value=datetime.strptime(slot["end"], "%H:%M").time(),
+            key=f"edit_slot_end_{interviewer_id}",
+        )
+
+    col_save, col_cancel = st.columns(2)
+    with col_save:
+        if st.button("Save Changes", type="primary", key=f"save_edit_{interviewer_id}"):
+            # Validate
+            if new_end <= new_start:
+                st.error("End time must be after start time")
+            elif new_date < date.today():
+                st.error("Cannot set date in the past")
+            else:
+                duration = (datetime.combine(date.today(), new_end) - datetime.combine(date.today(), new_start)).seconds // 60
+                if duration < 30:
+                    st.error("Slot must be at least 30 minutes")
+                else:
+                    # Update the slot
+                    slots[edit_slot_idx] = {
+                        "date": new_date.strftime("%Y-%m-%d"),
+                        "start": new_start.strftime("%H:%M"),
+                        "end": new_end.strftime("%H:%M"),
+                        "source": slot.get("source", "manual"),
+                    }
+                    st.session_state["panel_interviewers"][interviewer_idx]["slots"] = slots
+                    st.session_state["editing_slot_index"] = None
+                    st.success("Slot updated!")
+                    st.rerun()
+
+    with col_cancel:
+        if st.button("Cancel", key=f"cancel_edit_{interviewer_id}"):
+            st.session_state["editing_slot_index"] = None
+            st.rerun()
+
+    st.markdown("---")
 
 
 def extract_common_timezone(slots: List[Dict[str, str]]) -> Optional[str]:
@@ -905,10 +1137,23 @@ def main() -> None:
                     )
                     interviewers[idx]["file"] = uploaded
 
-                    # Show slot count after parsing
+                    # Show slot count with breakdown
                     slot_count = len(interviewer.get("slots", []))
+                    manual_count = len([s for s in interviewer.get("slots", []) if s.get("source") == "manual"])
+                    uploaded_count = slot_count - manual_count
                     if slot_count > 0:
-                        st.caption(f"Parsed {slot_count} slot(s)")
+                        if manual_count > 0 and uploaded_count > 0:
+                            st.caption(f"{slot_count} slot(s) ({manual_count} manual, {uploaded_count} uploaded)")
+                        elif manual_count > 0:
+                            st.caption(f"{slot_count} manual slot(s)")
+                        else:
+                            st.caption(f"{slot_count} uploaded slot(s)")
+
+                    # Manual slot entry expander
+                    with st.expander("Manual Slot Entry", expanded=False):
+                        _render_manual_slot_form(idx, interviewer["id"])
+                        _render_edit_slot_form(idx, interviewer["id"])
+                        _render_interviewer_slots(idx, interviewer["id"])
 
             st.session_state["panel_interviewers"] = interviewers
 
@@ -1478,7 +1723,10 @@ def _parse_availability_upload(upload) -> List[Dict[str, str]]:
 
 
 def _parse_all_panel_availability() -> None:
-    """Parse availability for all interviewers and compute intersection."""
+    """Parse availability for all interviewers and compute intersection.
+
+    Handles both uploaded files and manually-entered slots.
+    """
     from slot_intersection import (
         normalize_slots_to_utc,
         merge_adjacent_slots,
@@ -1492,29 +1740,41 @@ def _parse_all_panel_availability() -> None:
     all_interviewer_slots: Dict[int, List] = {}
     interviewer_names: Dict[int, str] = {}
     parse_errors = []
-    total_parsed = 0
+    total_uploaded = 0
+    total_manual = 0
 
     for interviewer in interviewers:
-        if not interviewer.get("file"):
-            continue
+        # Get existing manual slots (preserve them)
+        existing_manual_slots = [s for s in interviewer.get("slots", []) if s.get("source") == "manual"]
+        total_manual += len(existing_manual_slots)
 
         try:
-            # Reset file position before reading
-            interviewer["file"].seek(0)
-            # Parse the uploaded file
-            slots = _parse_availability_upload(interviewer["file"])
-            interviewer["slots"] = slots
-            total_parsed += len(slots)
+            if interviewer.get("file"):
+                # Reset file position before reading
+                interviewer["file"].seek(0)
+                # Parse the uploaded file
+                uploaded_slots = _parse_availability_upload(interviewer["file"])
+                # Mark uploaded slots with source
+                for s in uploaded_slots:
+                    s["source"] = "uploaded"
+                total_uploaded += len(uploaded_slots)
+                # Merge manual + uploaded, preferring manual for duplicates
+                interviewer["slots"] = _merge_slots(existing_manual_slots, uploaded_slots)
+            elif existing_manual_slots:
+                # No file but has manual slots - keep them
+                interviewer["slots"] = existing_manual_slots
 
-            # Build interviewer name for display
-            name = interviewer.get("name") or interviewer.get("email") or f"Interviewer {interviewer['id']}"
-            interviewer_names[interviewer["id"]] = name
+            # Include interviewer if they have any slots
+            if interviewer.get("slots"):
+                # Build interviewer name for display
+                name = interviewer.get("name") or interviewer.get("email") or f"Interviewer {interviewer['id']}"
+                interviewer_names[interviewer["id"]] = name
 
-            # Normalize to UTC for intersection
-            if slots:
-                normalized = normalize_slots_to_utc(slots, tz_name)
+                # Normalize to UTC for intersection
+                normalized = normalize_slots_to_utc(interviewer["slots"], tz_name)
                 merged = merge_adjacent_slots(normalized)
                 all_interviewer_slots[interviewer["id"]] = merged
+
         except Exception as e:
             interviewer_name = interviewer.get("name") or f"Interviewer {interviewer.get('id', '?')}"
             parse_errors.append(f"{interviewer_name}: {e}")
@@ -1537,16 +1797,29 @@ def _parse_all_panel_availability() -> None:
         st.session_state["slots"] = intersections
 
         num_interviewers = len(all_interviewer_slots)
+        total_slots = total_uploaded + total_manual
+
         if num_interviewers == 1:
-            st.success(f"Extracted {total_parsed} slot(s) from 1 interviewer.")
+            if total_manual > 0 and total_uploaded > 0:
+                st.success(f"Processed {total_slots} slot(s) ({total_manual} manual, {total_uploaded} uploaded).")
+            elif total_manual > 0:
+                st.success(f"Processed {total_manual} manual slot(s).")
+            else:
+                st.success(f"Extracted {total_uploaded} slot(s) from uploaded file.")
         else:
             full_overlap = sum(1 for s in intersections if s.get("is_full_overlap", False))
+            source_info = []
+            if total_manual > 0:
+                source_info.append(f"{total_manual} manual")
+            if total_uploaded > 0:
+                source_info.append(f"{total_uploaded} uploaded")
+            source_str = f" ({', '.join(source_info)})" if source_info else ""
             st.success(
-                f"Parsed {total_parsed} total slots from {num_interviewers} interviewers. "
+                f"Processed {total_slots} total slots{source_str} from {num_interviewers} interviewers. "
                 f"Found {len(intersections)} intersection slot(s) ({full_overlap} with all available)."
             )
     else:
-        st.warning("No availability files uploaded. Please upload at least one calendar.")
+        st.warning("No availability found. Please upload calendars or add slots manually.")
 
 
 def _zoneinfo(tz_name: str):
