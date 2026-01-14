@@ -253,6 +253,9 @@ class ICSInvite:
     location: str = ""
     url: str = ""  # e.g. Teams join URL
     display_timezone: str = "UTC"  # IANA timezone for VTIMEZONE component
+    sequence: int = 0  # RFC 5545: increment on updates/cancellations
+    method: str = "REQUEST"  # REQUEST, CANCEL, or REPLY
+    status: str = "CONFIRMED"  # CONFIRMED, CANCELLED, TENTATIVE
 
     def __post_init__(self):
         """Validate ICS invite data on construction."""
@@ -270,6 +273,14 @@ class ICSInvite:
         if self.dtstart_utc >= self.dtend_utc:
             errors.append("Start time must be before end time")
 
+        valid_methods = ("REQUEST", "CANCEL", "REPLY", "ADD", "REFRESH")
+        if self.method not in valid_methods:
+            errors.append(f"Method must be one of {valid_methods}")
+
+        valid_statuses = ("CONFIRMED", "CANCELLED", "TENTATIVE")
+        if self.status not in valid_statuses:
+            errors.append(f"Status must be one of {valid_statuses}")
+
         if errors:
             raise ICSValidationError(f"Invalid ICS invite: {'; '.join(errors)}")
 
@@ -280,6 +291,11 @@ class ICSInvite:
 
         If display_timezone is set to a supported timezone, includes a VTIMEZONE
         component for proper DST handling by calendar applications.
+
+        The method, sequence, and status fields control the ICS behavior:
+        - method: REQUEST for new/updated events, CANCEL for cancellations
+        - sequence: Increment on each update to ensure calendar clients refresh
+        - status: CONFIRMED, CANCELLED, or TENTATIVE
         """
         try:
             now = datetime.now(timezone.utc)
@@ -288,7 +304,7 @@ class ICSInvite:
                 "PRODID:-//PowerDash HR//Interview Scheduler//EN",
                 "VERSION:2.0",
                 "CALSCALE:GREGORIAN",
-                "METHOD:REQUEST",
+                f"METHOD:{self.method}",
             ]
 
             # Add VTIMEZONE component if timezone is supported (not UTC)
@@ -303,8 +319,8 @@ class ICSInvite:
                 f"DTEND:{_fmt_dt_utc(self.dtend_utc)}",
                 f"SUMMARY:{_escape_text(self.summary)}",
                 f"DESCRIPTION:{_escape_text(self.description + (('\\n' + self.url) if self.url else ''))}",
-                "STATUS:CONFIRMED",
-                "SEQUENCE:0",
+                f"STATUS:{self.status}",
+                f"SEQUENCE:{self.sequence}",
             ])
 
             if self.location:
@@ -324,3 +340,172 @@ class ICSInvite:
             return folded.encode("utf-8")
         except Exception as e:
             raise ICSValidationError(f"Failed to generate ICS: {e}") from e
+
+
+def generate_cancellation_ics(
+    original_invite: ICSInvite,
+    cancellation_reason: str = "",
+) -> bytes:
+    """
+    Generate an ICS cancellation notice for an existing invite.
+
+    RFC 5545 requires:
+    - Same UID as the original event
+    - Incremented SEQUENCE number
+    - METHOD:CANCEL
+    - STATUS:CANCELLED
+
+    Args:
+        original_invite: The original ICSInvite being cancelled
+        cancellation_reason: Optional reason to include in description
+
+    Returns:
+        ICS file bytes for the cancellation notice
+    """
+    description = "This interview has been cancelled."
+    if cancellation_reason:
+        description += f"\n\nReason: {cancellation_reason}"
+
+    cancelled = ICSInvite(
+        uid=original_invite.uid,  # MUST be same UID for calendar matching
+        dtstart_utc=original_invite.dtstart_utc,
+        dtend_utc=original_invite.dtend_utc,
+        summary=f"CANCELLED: {original_invite.summary}",
+        description=description,
+        organizer_email=original_invite.organizer_email,
+        organizer_name=original_invite.organizer_name,
+        attendee_emails=original_invite.attendee_emails,
+        location=original_invite.location,
+        display_timezone=original_invite.display_timezone,
+        sequence=original_invite.sequence + 1,  # Increment sequence
+        method="CANCEL",
+        status="CANCELLED",
+    )
+
+    return cancelled.to_ics()
+
+
+def generate_update_ics(
+    original_invite: ICSInvite,
+    new_start: datetime,
+    new_end: datetime,
+    new_sequence: Optional[int] = None,
+) -> bytes:
+    """
+    Generate an ICS update/reschedule notice for an existing invite.
+
+    RFC 5545 requires:
+    - Same UID as the original event
+    - Incremented SEQUENCE number
+    - METHOD:REQUEST (same as original)
+    - Updated DTSTART/DTEND
+
+    Args:
+        original_invite: The original ICSInvite being updated
+        new_start: New start datetime (UTC)
+        new_end: New end datetime (UTC)
+        new_sequence: Optional specific sequence number (default: original + 1)
+
+    Returns:
+        ICS file bytes for the update notice
+    """
+    sequence = new_sequence if new_sequence is not None else original_invite.sequence + 1
+
+    updated = ICSInvite(
+        uid=original_invite.uid,  # MUST be same UID for calendar matching
+        dtstart_utc=new_start,
+        dtend_utc=new_end,
+        summary=original_invite.summary,
+        description=f"UPDATED: {original_invite.description}",
+        organizer_email=original_invite.organizer_email,
+        organizer_name=original_invite.organizer_name,
+        attendee_emails=original_invite.attendee_emails,
+        location=original_invite.location,
+        url=original_invite.url,
+        display_timezone=original_invite.display_timezone,
+        sequence=sequence,
+        method="REQUEST",
+        status="CONFIRMED",
+    )
+
+    return updated.to_ics()
+
+
+def create_ics_from_interview(
+    interview_data: dict,
+    organizer_email: str,
+    organizer_name: str = "Scheduler",
+    sequence: int = 0,
+    method: str = "REQUEST",
+    status: str = "CONFIRMED",
+) -> ICSInvite:
+    """
+    Create an ICSInvite from interview database record.
+
+    Args:
+        interview_data: Dict with keys: ics_uid, start_utc, end_utc, subject,
+                        candidate_email, display_timezone, teams_join_url
+        organizer_email: Email of the organizer/scheduler
+        organizer_name: Display name of the organizer
+        sequence: ICS sequence number
+        method: ICS method (REQUEST, CANCEL, etc.)
+        status: ICS status (CONFIRMED, CANCELLED, etc.)
+
+    Returns:
+        ICSInvite ready for to_ics() or modification
+    """
+    from datetime import datetime
+
+    # Parse times from ISO format
+    start_str = interview_data.get("start_utc", "")
+    end_str = interview_data.get("end_utc", "")
+
+    # Handle various datetime formats
+    for fmt in ["%Y-%m-%dT%H:%M:%S+00:00", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"]:
+        try:
+            dtstart = datetime.strptime(start_str.replace("+00:00", "").replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+            dtstart = dtstart.replace(tzinfo=timezone.utc)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ICSValidationError(f"Cannot parse start time: {start_str}")
+
+    for fmt in ["%Y-%m-%dT%H:%M:%S+00:00", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"]:
+        try:
+            dtend = datetime.strptime(end_str.replace("+00:00", "").replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+            dtend = dtend.replace(tzinfo=timezone.utc)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ICSValidationError(f"Cannot parse end time: {end_str}")
+
+    # Build attendee list
+    attendees = []
+    candidate_email = interview_data.get("candidate_email", "")
+    if candidate_email:
+        attendees.append(candidate_email)
+
+    # UID from database or generate new one
+    uid = interview_data.get("ics_uid") or stable_uid(
+        interview_data.get("graph_event_id", ""),
+        candidate_email,
+        start_str,
+    )
+
+    return ICSInvite(
+        uid=uid,
+        dtstart_utc=dtstart,
+        dtend_utc=dtend,
+        summary=interview_data.get("subject", "Interview"),
+        description=f"Interview for {interview_data.get('role_title', 'Position')}",
+        organizer_email=organizer_email,
+        organizer_name=organizer_name,
+        attendee_emails=attendees,
+        url=interview_data.get("teams_join_url", ""),
+        display_timezone=interview_data.get("display_timezone", "UTC"),
+        sequence=sequence,
+        method=method,
+        status=status,
+    )

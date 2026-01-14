@@ -31,6 +31,16 @@ class LogLevel(Enum):
     CRITICAL = "CRITICAL"
 
 
+class InterviewStatus(Enum):
+    """Interview lifecycle statuses for tracking."""
+    PENDING = "pending"          # Invite created, awaiting response
+    CONFIRMED = "confirmed"      # Candidate confirmed
+    RESCHEDULED = "rescheduled"  # Time changed
+    CANCELLED = "cancelled"      # Interview cancelled
+    COMPLETED = "completed"      # Interview took place
+    NO_SHOW = "no_show"          # Candidate didn't attend
+
+
 def _setup_logger() -> logging.Logger:
     """Configure structured JSON-style logger for production diagnostics."""
     logger = logging.getLogger("powerdash")
@@ -230,6 +240,71 @@ class AuditLog:
                         "Added is_group_interview column to interviews table",
                         action="db_migration",
                     )
+
+                # Migration: Add status tracking columns
+                try:
+                    conn.execute("SELECT status_reason FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN status_reason TEXT")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added status_reason column to interviews table",
+                        action="db_migration",
+                    )
+
+                try:
+                    conn.execute("SELECT status_updated_utc FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN status_updated_utc TEXT")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added status_updated_utc column to interviews table",
+                        action="db_migration",
+                    )
+
+                try:
+                    conn.execute("SELECT status_updated_by FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN status_updated_by TEXT")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added status_updated_by column to interviews table",
+                        action="db_migration",
+                    )
+
+                # Migration: Add ICS tracking columns
+                try:
+                    conn.execute("SELECT ics_sequence FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN ics_sequence INTEGER DEFAULT 0")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added ics_sequence column to interviews table",
+                        action="db_migration",
+                    )
+
+                try:
+                    conn.execute("SELECT ics_uid FROM interviews LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute("ALTER TABLE interviews ADD COLUMN ics_uid TEXT")
+                    conn.commit()
+                    log_structured(
+                        LogLevel.INFO,
+                        "Added ics_uid column to interviews table",
+                        action="db_migration",
+                    )
+
+                # Migration: Add index for faster event_id lookups in audit_log
+                try:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_event_id ON audit_log(event_id)")
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # Index may already exist
+
             finally:
                 conn.close()
         except sqlite3.Error as e:
@@ -468,15 +543,33 @@ class AuditLog:
             )
             return []
 
-    def list_interviews(self, limit: int = 200) -> List[Dict[str, Any]]:
-        """List recent interviews. Returns empty list on error."""
+    def list_interviews(
+        self,
+        limit: int = 200,
+        status_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        List recent interviews with optional status filtering.
+
+        Args:
+            limit: Maximum number of interviews to return
+            status_filter: Optional status to filter by (e.g., "pending", "cancelled")
+
+        Returns empty list on error.
+        """
         try:
             conn = self._connect()
             try:
-                rows = conn.execute(
-                    "SELECT * FROM interviews ORDER BY id DESC LIMIT ?",
-                    (int(limit),),
-                ).fetchall()
+                if status_filter:
+                    rows = conn.execute(
+                        "SELECT * FROM interviews WHERE last_status = ? ORDER BY id DESC LIMIT ?",
+                        (status_filter.lower(), int(limit)),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM interviews ORDER BY id DESC LIMIT ?",
+                        (int(limit),),
+                    ).fetchall()
                 return [dict(r) for r in rows]
             finally:
                 conn.close()
@@ -489,3 +582,199 @@ class AuditLog:
                 exc_info=True,
             )
             return []
+
+    def update_interview_status(
+        self,
+        event_id: str,
+        new_status: InterviewStatus,
+        reason: Optional[str] = None,
+        updated_by: Optional[str] = None,
+    ) -> bool:
+        """
+        Update interview status with audit trail.
+
+        Args:
+            event_id: Graph event ID of the interview
+            new_status: New InterviewStatus value
+            reason: Optional reason for the status change
+            updated_by: Email of user who made the change
+
+        Returns True on success, False on failure.
+        """
+        try:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE interviews
+                    SET last_status = ?,
+                        status_reason = ?,
+                        status_updated_utc = ?,
+                        status_updated_by = ?
+                    WHERE graph_event_id = ?
+                    """,
+                    (
+                        new_status.value,
+                        reason,
+                        utc_now_iso(),
+                        updated_by,
+                        event_id,
+                    ),
+                )
+                conn.commit()
+                log_structured(
+                    LogLevel.INFO,
+                    f"Interview status updated to {new_status.value}",
+                    action="status_update",
+                    details={"event_id": event_id, "new_status": new_status.value},
+                )
+                return True
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            log_structured(
+                LogLevel.ERROR,
+                f"Failed to update interview status: {e}",
+                action="status_update",
+                error_type="sqlite_error",
+                exc_info=True,
+            )
+            return False
+
+    def get_interview_history(self, event_id: str) -> List[Dict[str, Any]]:
+        """
+        Get complete audit history for a specific interview.
+
+        Args:
+            event_id: Graph event ID of the interview
+
+        Returns list of audit log entries in descending order (newest first).
+        """
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM audit_log
+                    WHERE event_id = ?
+                    ORDER BY timestamp_utc DESC
+                    """,
+                    (event_id,),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            log_structured(
+                LogLevel.ERROR,
+                f"Failed to get interview history: {e}",
+                action="get_history",
+                error_type="sqlite_error",
+                exc_info=True,
+            )
+            return []
+
+    def increment_ics_sequence(self, event_id: str) -> int:
+        """
+        Increment and return the ICS sequence number for an interview.
+
+        RFC 5545 requires incrementing SEQUENCE on any update to an event.
+        This ensures calendar clients properly update their cached events.
+
+        Args:
+            event_id: Graph event ID of the interview
+
+        Returns the new sequence number, or -1 on error.
+        """
+        try:
+            conn = self._connect()
+            try:
+                # Increment and return in one transaction
+                conn.execute(
+                    """
+                    UPDATE interviews
+                    SET ics_sequence = COALESCE(ics_sequence, 0) + 1
+                    WHERE graph_event_id = ?
+                    """,
+                    (event_id,),
+                )
+                conn.commit()
+
+                # Get the new value
+                row = conn.execute(
+                    "SELECT ics_sequence FROM interviews WHERE graph_event_id = ?",
+                    (event_id,),
+                ).fetchone()
+
+                return row["ics_sequence"] if row else -1
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            log_structured(
+                LogLevel.ERROR,
+                f"Failed to increment ICS sequence: {e}",
+                action="ics_sequence_increment",
+                error_type="sqlite_error",
+                exc_info=True,
+            )
+            return -1
+
+    def get_interview_by_event_id(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get interview record by Graph event ID.
+
+        Args:
+            event_id: Graph event ID of the interview
+
+        Returns interview dict or None if not found.
+        """
+        try:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT * FROM interviews WHERE graph_event_id = ?",
+                    (event_id,),
+                ).fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            log_structured(
+                LogLevel.ERROR,
+                f"Failed to get interview by event ID: {e}",
+                action="get_interview",
+                error_type="sqlite_error",
+                exc_info=True,
+            )
+            return None
+
+    def update_interview_ics_uid(self, event_id: str, ics_uid: str) -> bool:
+        """
+        Store the ICS UID for an interview.
+
+        Args:
+            event_id: Graph event ID of the interview
+            ics_uid: The stable ICS UID for calendar tracking
+
+        Returns True on success, False on failure.
+        """
+        try:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "UPDATE interviews SET ics_uid = ? WHERE graph_event_id = ?",
+                    (ics_uid, event_id),
+                )
+                conn.commit()
+                return True
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            log_structured(
+                LogLevel.ERROR,
+                f"Failed to update ICS UID: {e}",
+                action="update_ics_uid",
+                error_type="sqlite_error",
+                exc_info=True,
+            )
+            return False

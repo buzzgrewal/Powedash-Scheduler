@@ -21,8 +21,8 @@ except Exception:
     OpenAI = None  # type: ignore
 
 from graph_client import GraphClient, GraphConfig, GraphAPIError, GraphAuthError
-from audit_log import AuditLog, LogLevel, log_structured
-from ics_utils import ICSInvite, stable_uid, ICSValidationError
+from audit_log import AuditLog, LogLevel, log_structured, InterviewStatus
+from ics_utils import ICSInvite, stable_uid, ICSValidationError, create_ics_from_interview, generate_cancellation_ics
 from timezone_utils import to_utc, from_utc, iso_utc, is_valid_timezone, safe_zoneinfo
 
 
@@ -636,6 +636,11 @@ def ensure_session_state() -> None:
         "slot_filter_min_n": 1,  # Minimum N for "any_n" mode
         "computed_intersections": [],  # Intersection slots with availability metadata
         "editing_slot_index": None,  # Track which slot is being edited: (interviewer_idx, slot_idx) or None
+        # Interview management UI state
+        "cancelling_interview_id": None,  # ID of interview being cancelled (for confirmation dialog)
+        "rescheduling_interview_id": None,  # ID of interview being rescheduled (for confirmation dialog)
+        "viewing_interview_history": None,  # Event ID for viewing history
+        "interview_status_filter": "All",  # Status filter for interviews list
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1178,6 +1183,234 @@ Best regards,
 ---
 Sent from {company.sender_email}
 """
+
+
+def build_cancellation_email_html(
+    candidate_name: str,
+    role_title: str,
+    interview_time: str,
+    reason: str,
+    custom_message: Optional[str],
+    company: CompanyConfig,
+) -> str:
+    """
+    Build HTML email for interview cancellation notification.
+
+    Args:
+        candidate_name: Name of the candidate
+        role_title: Job title/role
+        interview_time: Formatted interview time
+        reason: Cancellation reason
+        custom_message: Optional additional message
+        company: Company branding configuration
+    """
+    logo_html = _build_logo_html(company)
+    greeting = f"Dear {candidate_name}," if candidate_name else "Hello,"
+
+    custom_section = ""
+    if custom_message:
+        custom_section = f'''
+        <p style="margin: 16px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+            {custom_message}
+        </p>
+        '''
+
+    website_link = ""
+    if company.website:
+        website_link = f'<p style="margin: 8px 0 0 0; font-size: 13px;"><a href="{company.website}" style="color: {company.primary_color}; text-decoration: none;">{company.website}</a></p>'
+
+    return f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f4f4;">
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color: #f4f4f4;">
+        <tr>
+            <td align="center" style="padding: 20px 10px;">
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0"
+                       style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                    {logo_html}
+                    <tr>
+                        <td style="padding: 32px 40px;">
+                            <p style="margin: 0 0 16px 0; color: #333333; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                {greeting}
+                            </p>
+                            <!-- Cancellation notice box -->
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                                   style="margin: 16px 0; background-color: #fff3cd; border-left: 4px solid #ffc107; border-radius: 4px;">
+                                <tr>
+                                    <td style="padding: 16px;">
+                                        <p style="margin: 0 0 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 16px; font-weight: 600; color: #856404;">
+                                            Interview Cancelled
+                                        </p>
+                                        <p style="margin: 0; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; color: #856404;">
+                                            We regret to inform you that your interview for the <strong>{role_title}</strong> position
+                                            scheduled for <strong>{interview_time}</strong> has been cancelled.
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
+                            <!-- Reason -->
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                                   style="margin: 16px 0; background-color: #f9f9f9; border-radius: 4px;">
+                                <tr>
+                                    <td style="padding: 16px;">
+                                        <p style="margin: 0; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; color: #333333;">
+                                            <strong>Reason:</strong> {reason}
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
+                            {custom_section}
+                            <p style="margin: 16px 0 0 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                We apologize for any inconvenience this may cause. If you have any questions, please reply to this email.
+                            </p>
+                        </td>
+                    </tr>
+                    <!-- Signature -->
+                    <tr>
+                        <td style="padding: 20px 40px; background-color: #f8f9fa; border-top: 1px solid #e9ecef; border-radius: 0 0 8px 8px;">
+                            <p style="margin: 0; color: #666666; font-family: {_EMAIL_FONT_STACK}; font-size: 14px;">
+                                Best regards,<br/>
+                                <strong style="color: {company.primary_color};">{company.signature_name}</strong>
+                            </p>
+                            {website_link}
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>'''
+
+
+def build_reschedule_email_html(
+    candidate_name: str,
+    role_title: str,
+    old_time: str,
+    new_time: str,
+    teams_url: Optional[str],
+    company: CompanyConfig,
+) -> str:
+    """
+    Build HTML email for interview reschedule notification.
+
+    Args:
+        candidate_name: Name of the candidate
+        role_title: Job title/role
+        old_time: Previous interview time (formatted)
+        new_time: New interview time (formatted)
+        teams_url: Optional Microsoft Teams meeting URL
+        company: Company branding configuration
+    """
+    logo_html = _build_logo_html(company)
+    greeting = f"Dear {candidate_name}," if candidate_name else "Hello,"
+
+    meeting_section = ""
+    if teams_url:
+        meeting_section = f'''
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+               style="margin: 16px 0; background-color: #f0f7ff; border-left: 4px solid {company.primary_color}; border-radius: 4px;">
+            <tr>
+                <td style="padding: 16px;">
+                    <p style="margin: 0 0 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; font-weight: 600; color: #333333;">
+                        Microsoft Teams Meeting
+                    </p>
+                    <a href="{teams_url}" style="color: {company.primary_color}; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; word-break: break-all;">
+                        Join Meeting
+                    </a>
+                </td>
+            </tr>
+        </table>
+        '''
+
+    website_link = ""
+    if company.website:
+        website_link = f'<p style="margin: 8px 0 0 0; font-size: 13px;"><a href="{company.website}" style="color: {company.primary_color}; text-decoration: none;">{company.website}</a></p>'
+
+    return f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f4f4;">
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color: #f4f4f4;">
+        <tr>
+            <td align="center" style="padding: 20px 10px;">
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0"
+                       style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                    {logo_html}
+                    <tr>
+                        <td style="padding: 32px 40px;">
+                            <p style="margin: 0 0 16px 0; color: #333333; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                {greeting}
+                            </p>
+                            <!-- Reschedule notice box -->
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                                   style="margin: 16px 0; background-color: #d4edda; border-left: 4px solid #28a745; border-radius: 4px;">
+                                <tr>
+                                    <td style="padding: 16px;">
+                                        <p style="margin: 0 0 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 16px; font-weight: 600; color: #155724;">
+                                            Interview Rescheduled
+                                        </p>
+                                        <p style="margin: 0; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; color: #155724;">
+                                            Your interview for the <strong>{role_title}</strong> position has been rescheduled.
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
+                            <!-- Time comparison -->
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                                   style="margin: 16px 0; background-color: #f9f9f9; border-radius: 4px;">
+                                <tr>
+                                    <td style="padding: 16px;">
+                                        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                                            <tr>
+                                                <td style="padding: 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; color: #666;">
+                                                    <strong>Previous Time:</strong>
+                                                </td>
+                                                <td style="padding: 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; color: #999; text-decoration: line-through;">
+                                                    {old_time}
+                                                </td>
+                                            </tr>
+                                            <tr>
+                                                <td style="padding: 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; color: #155724;">
+                                                    <strong>New Time:</strong>
+                                                </td>
+                                                <td style="padding: 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; font-weight: 600; color: #155724;">
+                                                    {new_time}
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                            {meeting_section}
+                            <p style="margin: 16px 0 0 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                                An updated calendar invitation has been sent. Please update your calendar accordingly.
+                            </p>
+                        </td>
+                    </tr>
+                    <!-- Signature -->
+                    <tr>
+                        <td style="padding: 20px 40px; background-color: #f8f9fa; border-top: 1px solid #e9ecef; border-radius: 0 0 8px 8px;">
+                            <p style="margin: 0; color: #666666; font-family: {_EMAIL_FONT_STACK}; font-size: 14px;">
+                                Best regards,<br/>
+                                <strong style="color: {company.primary_color};">{company.signature_name}</strong>
+                            </p>
+                            {website_link}
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>'''
 
 
 def _smtp_cfg() -> Optional[Dict[str, Any]]:
@@ -2080,8 +2313,8 @@ def main() -> None:
 
     # ========= TAB: Calendar Invites =========
     with tab_invites:
-        st.subheader("Calendar Invites")
-        st.caption("Manage scheduled interviews (reschedule/cancel).")
+        st.subheader("Interview Management")
+        st.caption("Manage scheduled interviews: reschedule, cancel, or view history.")
 
         def _format_candidates_display(interview_row: Dict[str, Any]) -> str:
             """Format candidate display for table, handling multi-candidate interviews."""
@@ -2106,23 +2339,103 @@ def main() -> None:
                 return "Panel"
             return "Individual"
 
-        interviews = audit.list_interviews(limit=200)
+        def _get_status_badge(status: str) -> str:
+            """Return status with emoji badge."""
+            status_badges = {
+                "pending": "Pending",
+                "confirmed": "Confirmed",
+                "rescheduled": "Rescheduled",
+                "cancelled": "Cancelled",
+                "completed": "Completed",
+                "no_show": "No Show",
+                "created": "Created",
+                "scheduled": "Scheduled",
+            }
+            return status_badges.get(status.lower() if status else "", status or "Unknown")
+
+        def _render_interview_history(audit_instance: AuditLog, event_id: str):
+            """Display complete history for selected interview."""
+            st.markdown("#### Interview History")
+
+            history = audit_instance.get_interview_history(event_id)
+
+            if not history:
+                st.info("No history entries for this interview.")
+                return
+
+            # Action color mapping
+            action_colors = {
+                "graph_create_event": "#28a745",     # Green
+                "interview_rescheduled": "#ffc107", # Yellow
+                "interview_cancelled": "#dc3545",   # Red
+                "notification_sent": "#17a2b8",      # Blue
+            }
+
+            for entry in history:
+                action = entry.get("action", "")
+                timestamp = entry.get("timestamp_utc", "")[:16]
+                actor = entry.get("actor", "System") or "System"
+                status = entry.get("status", "")
+
+                color = action_colors.get(action, "#6c757d")
+
+                col_time, col_action, col_status = st.columns([2, 4, 2])
+                with col_time:
+                    st.caption(timestamp)
+                with col_action:
+                    st.markdown(f"<span style='color: {color}; font-weight: 600;'>{action}</span>", unsafe_allow_html=True)
+                with col_status:
+                    st.caption(f"{status} | {actor[:20]}")
+
+                # Show details in expander
+                payload_json = entry.get("payload_json")
+                if payload_json:
+                    with st.expander("Details", expanded=False):
+                        try:
+                            st.json(json.loads(payload_json))
+                        except json.JSONDecodeError:
+                            st.text(payload_json)
+
+                st.markdown("---")
+
+        # Filter controls
+        col_filter1, col_filter2 = st.columns(2)
+        with col_filter1:
+            status_filter = st.selectbox(
+                "Filter by status",
+                options=["All", "Pending", "Confirmed", "Rescheduled", "Cancelled", "Scheduled", "Created"],
+                key="invites_status_filter"
+            )
+        with col_filter2:
+            search_term = st.text_input("Search candidate/role", key="invites_search", placeholder="Search...")
+
+        # Get interviews with optional filter
+        filter_value = None if status_filter == "All" else status_filter.lower()
+        interviews = audit.list_interviews(limit=200, status_filter=filter_value)
+
+        # Apply search filter
+        if search_term:
+            search_lower = search_term.lower()
+            interviews = [
+                r for r in interviews
+                if search_lower in (r.get("candidate_email", "") or "").lower()
+                or search_lower in (r.get("role_title", "") or "").lower()
+            ]
+
         if not interviews:
-            st.info("No interviews stored yet. Create an invite from the first tab.")
+            st.info("No interviews match the current filters. Create an invite from the first tab.")
         else:
-            # show compact table
+            # Show compact table
             st.dataframe(
                 [
                     {
-                        "created_utc": r["created_utc"],
-                        "role_title": r["role_title"],
+                        "created": r["created_utc"][:10] if r.get("created_utc") else "",
+                        "role": r.get("role_title", ""),
                         "type": _format_interview_type(r),
                         "candidate(s)": _format_candidates_display(r),
-                        "hiring_manager": r["hiring_manager_email"],
-                        "start_utc": r["start_utc"],
-                        "graph_event_id": r["graph_event_id"],
-                        "teams_join_url": (r["teams_join_url"][:45] + "…") if r.get("teams_join_url") else "",
-                        "status": r.get("last_status", ""),
+                        "start_utc": r.get("start_utc", "")[:16] if r.get("start_utc") else "",
+                        "status": _get_status_badge(r.get("last_status", "")),
+                        "event_id": (r.get("graph_event_id", "") or "")[:12] + "..." if r.get("graph_event_id") else "",
                     }
                     for r in interviews
                 ],
@@ -2131,40 +2444,220 @@ def main() -> None:
             )
 
             st.markdown("----")
-            st.markdown("#### Reschedule / Cancel")
 
-            event_ids = [r["graph_event_id"] for r in interviews if r.get("graph_event_id")]
-            selected_event_id = st.selectbox("Select event", options=event_ids)
-            selected_row = next((r for r in interviews if r.get("graph_event_id") == selected_event_id), None)
+            # Check for active confirmation dialogs
+            cancelling_id = st.session_state.get("cancelling_interview_id")
+            rescheduling_id = st.session_state.get("rescheduling_interview_id")
+            viewing_history_id = st.session_state.get("viewing_interview_history")
 
-            if selected_row:
-                display_tz = st.selectbox("Display timezone", options=_common_timezones(), index=_tz_index(selected_row.get("display_timezone")))
-                st.write(f"Current start (UTC): {selected_row.get('start_utc')}")
-                st.write(f"Current end (UTC): {selected_row.get('end_utc')}")
-                try:
-                    start_local = from_utc(datetime.fromisoformat(selected_row["start_utc"]), display_tz)
-                except Exception:
-                    start_local = None
+            # Interview History View
+            if viewing_history_id:
+                st.markdown("### Interview History")
+                if st.button("Back to Interview List", key="back_from_history"):
+                    st.session_state["viewing_interview_history"] = None
+                    st.rerun()
+                _render_interview_history(audit, viewing_history_id)
 
-                new_date = st.date_input("New date", value=start_local.date() if start_local else datetime.now().date())
-                new_time = st.time_input("New time", value=start_local.time().replace(second=0, microsecond=0) if start_local else datetime.now().time().replace(second=0, microsecond=0))
-                new_duration = st.number_input("Duration (minutes)", min_value=15, max_value=240, step=15, value=int(selected_row.get("duration_minutes") or 30))
+            # Cancellation Confirmation Dialog
+            elif cancelling_id:
+                cancel_row = next((r for r in interviews if r.get("graph_event_id") == cancelling_id), None)
+                if cancel_row:
+                    st.markdown("### Confirm Cancellation")
+                    st.warning(f"""
+                    **You are about to cancel this interview:**
+                    - **Role:** {cancel_row.get('role_title', '')}
+                    - **Candidate:** {cancel_row.get('candidate_email', '')}
+                    - **Time:** {cancel_row.get('start_utc', '')}
 
-                colA, colB = st.columns(2)
-                with colA:
-                    if st.button("Reschedule", type="primary"):
-                        _handle_reschedule(
-                            audit=audit,
-                            event_id=selected_event_id,
-                            new_date=new_date,
-                            new_time=new_time,
-                            duration_minutes=int(new_duration),
-                            tz_name=display_tz,
-                            context_row=selected_row,
+                    This action cannot be undone. The candidate will receive a cancellation notice.
+                    """)
+
+                    cancel_reason = st.selectbox(
+                        "Cancellation reason",
+                        options=[
+                            "Candidate requested",
+                            "Position filled",
+                            "Position closed",
+                            "Interviewer unavailable",
+                            "Scheduling conflict",
+                            "Other"
+                        ],
+                        key="cancel_reason_select"
+                    )
+
+                    custom_reason = ""
+                    if cancel_reason == "Other":
+                        custom_reason = st.text_input("Please specify reason", key="cancel_custom_reason")
+
+                    notify_candidate = st.checkbox("Send cancellation email to candidate", value=True, key="cancel_notify")
+                    candidate_message = ""
+                    if notify_candidate:
+                        candidate_message = st.text_area(
+                            "Message to candidate (optional)",
+                            placeholder="We apologize for any inconvenience...",
+                            key="cancel_message"
                         )
-                with colB:
-                    if st.button("Cancel", type="secondary"):
-                        _handle_cancel(audit=audit, event_id=selected_event_id, context_row=selected_row)
+
+                    col_confirm, col_back = st.columns(2)
+                    with col_confirm:
+                        if st.button("Confirm Cancellation", type="primary", key="confirm_cancel_btn"):
+                            final_reason = custom_reason if cancel_reason == "Other" else cancel_reason
+                            _handle_cancel(
+                                audit=audit,
+                                event_id=cancelling_id,
+                                context_row=cancel_row,
+                                reason=final_reason,
+                                notify_candidate=notify_candidate,
+                                candidate_message=candidate_message,
+                            )
+                            st.session_state["cancelling_interview_id"] = None
+                            st.rerun()
+                    with col_back:
+                        if st.button("Go Back", key="cancel_back_btn"):
+                            st.session_state["cancelling_interview_id"] = None
+                            st.rerun()
+                else:
+                    st.session_state["cancelling_interview_id"] = None
+                    st.rerun()
+
+            # Reschedule Confirmation Dialog
+            elif rescheduling_id:
+                resched_row = next((r for r in interviews if r.get("graph_event_id") == rescheduling_id), None)
+                if resched_row:
+                    st.markdown("### Reschedule Interview")
+
+                    # Display current info
+                    st.info(f"""
+                    **Rescheduling interview:**
+                    - **Role:** {resched_row.get('role_title', '')}
+                    - **Candidate:** {resched_row.get('candidate_email', '')}
+                    - **Current Time:** {resched_row.get('start_utc', '')}
+                    """)
+
+                    display_tz = st.selectbox(
+                        "Timezone",
+                        options=_common_timezones(),
+                        index=_tz_index(resched_row.get("display_timezone")),
+                        key="resched_tz"
+                    )
+
+                    try:
+                        start_local = from_utc(datetime.fromisoformat(resched_row["start_utc"]), display_tz)
+                    except Exception:
+                        start_local = None
+
+                    col_date, col_time = st.columns(2)
+                    with col_date:
+                        new_date = st.date_input(
+                            "New date",
+                            value=start_local.date() if start_local else datetime.now().date(),
+                            key="resched_date"
+                        )
+                    with col_time:
+                        new_time = st.time_input(
+                            "New time",
+                            value=start_local.time().replace(second=0, microsecond=0) if start_local else datetime.now().time().replace(second=0, microsecond=0),
+                            key="resched_time"
+                        )
+
+                    new_duration = st.number_input(
+                        "Duration (minutes)",
+                        min_value=15,
+                        max_value=240,
+                        step=15,
+                        value=int(resched_row.get("duration_minutes") or 30),
+                        key="resched_duration"
+                    )
+
+                    reschedule_reason = st.selectbox(
+                        "Reason for reschedule",
+                        options=[
+                            "Candidate requested",
+                            "Interviewer unavailable",
+                            "Scheduling conflict",
+                            "Time zone adjustment",
+                            "Other"
+                        ],
+                        key="reschedule_reason_select"
+                    )
+
+                    notify_candidate = st.checkbox(
+                        "Send update notification to candidate",
+                        value=True,
+                        key="reschedule_notify"
+                    )
+
+                    col_confirm, col_back = st.columns(2)
+                    with col_confirm:
+                        if st.button("Confirm Reschedule", type="primary", key="confirm_resched_btn"):
+                            _handle_reschedule(
+                                audit=audit,
+                                event_id=rescheduling_id,
+                                new_date=new_date,
+                                new_time=new_time,
+                                duration_minutes=int(new_duration),
+                                tz_name=display_tz,
+                                context_row=resched_row,
+                                reason=reschedule_reason,
+                                notify_candidate=notify_candidate,
+                            )
+                            st.session_state["rescheduling_interview_id"] = None
+                            st.rerun()
+                    with col_back:
+                        if st.button("Go Back", key="resched_back_btn"):
+                            st.session_state["rescheduling_interview_id"] = None
+                            st.rerun()
+                else:
+                    st.session_state["rescheduling_interview_id"] = None
+                    st.rerun()
+
+            # Default view - Interview management
+            else:
+                st.markdown("#### Manage Interview")
+
+                # Only show non-cancelled interviews for management
+                manageable = [r for r in interviews if r.get("last_status", "").lower() != "cancelled"]
+                if not manageable:
+                    st.info("No active interviews to manage. All interviews are cancelled or none exist.")
+                else:
+                    event_ids = [r["graph_event_id"] for r in manageable if r.get("graph_event_id")]
+                    if event_ids:
+                        selected_event_id = st.selectbox(
+                            "Select interview",
+                            options=event_ids,
+                            format_func=lambda x: next(
+                                (f"{r.get('role_title', '')} - {r.get('candidate_email', '')} ({r.get('start_utc', '')[:10]})"
+                                 for r in manageable if r.get("graph_event_id") == x),
+                                x
+                            ),
+                            key="manage_event_select"
+                        )
+                        selected_row = next((r for r in manageable if r.get("graph_event_id") == selected_event_id), None)
+
+                        if selected_row:
+                            # Show interview details
+                            st.markdown(f"""
+                            **Selected Interview:**
+                            - **Role:** {selected_row.get('role_title', '')}
+                            - **Candidate:** {selected_row.get('candidate_email', '')}
+                            - **Start:** {selected_row.get('start_utc', '')}
+                            - **Status:** {_get_status_badge(selected_row.get('last_status', ''))}
+                            """)
+
+                            # Action buttons
+                            col_resched, col_cancel, col_history = st.columns(3)
+                            with col_resched:
+                                if st.button("Reschedule", type="primary", key="btn_reschedule"):
+                                    st.session_state["rescheduling_interview_id"] = selected_event_id
+                                    st.rerun()
+                            with col_cancel:
+                                if st.button("Cancel", type="secondary", key="btn_cancel"):
+                                    st.session_state["cancelling_interview_id"] = selected_event_id
+                                    st.rerun()
+                            with col_history:
+                                if st.button("View History", key="btn_history"):
+                                    st.session_state["viewing_interview_history"] = selected_event_id
+                                    st.rerun()
 
     # ========= TAB: Audit Log =========
     with tab_audit:
@@ -3283,6 +3776,92 @@ def _handle_create_invite(
         )
 
 
+def _send_cancellation_email(
+    client: GraphClient,
+    candidate_email: str,
+    candidate_name: str,
+    role_title: str,
+    interview_time: str,
+    reason: str,
+    custom_message: str,
+    company: CompanyConfig,
+) -> bool:
+    """Send cancellation notification email to candidate."""
+    try:
+        html_body = build_cancellation_email_html(
+            candidate_name=candidate_name,
+            role_title=role_title,
+            interview_time=interview_time,
+            reason=reason,
+            custom_message=custom_message if custom_message else None,
+            company=company,
+        )
+        client.send_mail(
+            subject=f"Interview Cancelled: {role_title} at {company.name}",
+            body=html_body,
+            to_recipients=[candidate_email],
+            content_type="HTML",
+        )
+        log_structured(
+            LogLevel.INFO,
+            f"Cancellation email sent to {candidate_email}",
+            action="cancellation_email_sent",
+        )
+        return True
+    except Exception as e:
+        log_structured(
+            LogLevel.ERROR,
+            f"Failed to send cancellation email: {e}",
+            action="cancellation_email_failed",
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
+        return False
+
+
+def _send_reschedule_email(
+    client: GraphClient,
+    candidate_email: str,
+    candidate_name: str,
+    role_title: str,
+    old_time: str,
+    new_time: str,
+    teams_url: Optional[str],
+    company: CompanyConfig,
+) -> bool:
+    """Send reschedule notification email to candidate."""
+    try:
+        html_body = build_reschedule_email_html(
+            candidate_name=candidate_name,
+            role_title=role_title,
+            old_time=old_time,
+            new_time=new_time,
+            teams_url=teams_url,
+            company=company,
+        )
+        client.send_mail(
+            subject=f"Interview Rescheduled: {role_title} at {company.name}",
+            body=html_body,
+            to_recipients=[candidate_email],
+            content_type="HTML",
+        )
+        log_structured(
+            LogLevel.INFO,
+            f"Reschedule email sent to {candidate_email}",
+            action="reschedule_email_sent",
+        )
+        return True
+    except Exception as e:
+        log_structured(
+            LogLevel.ERROR,
+            f"Failed to send reschedule email: {e}",
+            action="reschedule_email_failed",
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
+        return False
+
+
 def _handle_reschedule(
     *,
     audit: AuditLog,
@@ -3292,16 +3871,43 @@ def _handle_reschedule(
     duration_minutes: int,
     tz_name: str,
     context_row: Dict[str, Any],
+    reason: str = "",
+    notify_candidate: bool = True,
 ) -> None:
+    """
+    Handle interview reschedule with status tracking and notifications.
+
+    Args:
+        audit: AuditLog instance
+        event_id: Graph event ID
+        new_date: New interview date
+        new_time: New interview time
+        duration_minutes: Interview duration
+        tz_name: Display timezone
+        context_row: Interview data from database
+        reason: Reason for reschedule
+        notify_candidate: Whether to send email notification
+    """
     client = _make_graph_client()
     if not client:
         st.error("Graph is not configured.")
         return
 
+    # Calculate new times
     start_local = datetime.combine(new_date, new_time).replace(tzinfo=_zoneinfo(tz_name))
     end_local = start_local + timedelta(minutes=duration_minutes)
     start_utc = to_utc(start_local)
     end_utc = to_utc(end_local)
+
+    # Store old time for notification
+    old_time_str = context_row.get("start_utc", "")
+    try:
+        old_dt = datetime.fromisoformat(old_time_str.replace("+00:00", "").replace("Z", ""))
+        old_time_formatted = old_dt.strftime("%A, %B %d, %Y at %I:%M %p UTC")
+    except Exception:
+        old_time_formatted = old_time_str
+
+    new_time_formatted = start_local.strftime("%A, %B %d, %Y at %I:%M %p") + f" ({tz_name})"
 
     patch = {
         "start": {"dateTime": start_local.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz_name},
@@ -3309,24 +3915,75 @@ def _handle_reschedule(
     }
 
     try:
+        # Patch the Graph event
         client.patch_event(event_id, patch, send_updates="all")
+
+        # Update interview status in database
+        audit.update_interview_status(
+            event_id=event_id,
+            new_status=InterviewStatus.RESCHEDULED,
+            reason=reason,
+            updated_by=context_row.get("recruiter_email"),
+        )
+
+        # Increment ICS sequence for proper calendar client update
+        audit.increment_ics_sequence(event_id)
+
+        # Log success
         audit.log(
-            "graph_reschedule_event",
+            "interview_rescheduled",
             actor=context_row.get("recruiter_email", "") or "",
             candidate_email=context_row.get("candidate_email", "") or "",
             hiring_manager_email=context_row.get("hiring_manager_email", "") or "",
             recruiter_email=context_row.get("recruiter_email", "") or "",
             role_title=context_row.get("role_title", "") or "",
             event_id=event_id,
-            payload=patch,
+            payload={
+                "old_start": old_time_str,
+                "new_start": start_utc.isoformat(),
+                "new_end": end_utc.isoformat(),
+                "reason": reason,
+                "notification_sent": notify_candidate,
+            },
             status="success",
         )
-        st.success("Event rescheduled. Attendees should receive updated invites.")
+
+        # Send notification email
+        notification_sent = False
+        if notify_candidate:
+            company = get_company_config()
+            candidate_email = context_row.get("candidate_email", "")
+            if candidate_email:
+                notification_sent = _send_reschedule_email(
+                    client=client,
+                    candidate_email=candidate_email,
+                    candidate_name="",  # Could be enhanced to parse from candidates_json
+                    role_title=context_row.get("role_title", ""),
+                    old_time=old_time_formatted,
+                    new_time=new_time_formatted,
+                    teams_url=context_row.get("teams_join_url"),
+                    company=company,
+                )
+                if notification_sent:
+                    audit.log(
+                        "notification_sent",
+                        actor=context_row.get("recruiter_email", "") or "",
+                        candidate_email=candidate_email,
+                        event_id=event_id,
+                        payload={"type": "reschedule"},
+                        status="success",
+                    )
+
+        if notify_candidate and notification_sent:
+            st.success("Event rescheduled. Candidate notified via email.")
+        else:
+            st.success("Event rescheduled. Attendees should receive updated invites.")
+
     except GraphAPIError as e:
         st.error("Reschedule failed.")
         st.json(e.response_json)
         audit.log(
-            "graph_reschedule_failed",
+            "interview_reschedule_failed",
             actor=context_row.get("recruiter_email", "") or "",
             candidate_email=context_row.get("candidate_email", "") or "",
             hiring_manager_email=context_row.get("hiring_manager_email", "") or "",
@@ -3339,31 +3996,103 @@ def _handle_reschedule(
         )
 
 
-def _handle_cancel(*, audit: AuditLog, event_id: str, context_row: Dict[str, Any]) -> None:
+def _handle_cancel(
+    *,
+    audit: AuditLog,
+    event_id: str,
+    context_row: Dict[str, Any],
+    reason: str = "",
+    notify_candidate: bool = True,
+    candidate_message: str = "",
+) -> None:
+    """
+    Handle interview cancellation with status tracking and notifications.
+
+    Args:
+        audit: AuditLog instance
+        event_id: Graph event ID
+        context_row: Interview data from database
+        reason: Cancellation reason
+        notify_candidate: Whether to send email notification
+        candidate_message: Optional custom message for candidate
+    """
     client = _make_graph_client()
     if not client:
         st.error("Graph is not configured.")
         return
 
+    # Format interview time for notification
+    interview_time_str = context_row.get("start_utc", "")
     try:
+        dt = datetime.fromisoformat(interview_time_str.replace("+00:00", "").replace("Z", ""))
+        interview_time_formatted = dt.strftime("%A, %B %d, %Y at %I:%M %p UTC")
+    except Exception:
+        interview_time_formatted = interview_time_str
+
+    try:
+        # Delete the calendar event
         client.delete_event(event_id)
+
+        # Update interview status in database
+        audit.update_interview_status(
+            event_id=event_id,
+            new_status=InterviewStatus.CANCELLED,
+            reason=reason,
+            updated_by=context_row.get("recruiter_email"),
+        )
+
+        # Log success
         audit.log(
-            "graph_cancel_event",
+            "interview_cancelled",
             actor=context_row.get("recruiter_email", "") or "",
             candidate_email=context_row.get("candidate_email", "") or "",
             hiring_manager_email=context_row.get("hiring_manager_email", "") or "",
             recruiter_email=context_row.get("recruiter_email", "") or "",
             role_title=context_row.get("role_title", "") or "",
             event_id=event_id,
-            payload={"event_id": event_id},
+            payload={
+                "reason": reason,
+                "notification_sent": notify_candidate,
+            },
             status="success",
         )
-        st.success("Event cancelled. Attendees should receive cancellation notices.")
+
+        # Send notification email
+        notification_sent = False
+        if notify_candidate:
+            company = get_company_config()
+            candidate_email = context_row.get("candidate_email", "")
+            if candidate_email:
+                notification_sent = _send_cancellation_email(
+                    client=client,
+                    candidate_email=candidate_email,
+                    candidate_name="",  # Could be enhanced to parse from candidates_json
+                    role_title=context_row.get("role_title", ""),
+                    interview_time=interview_time_formatted,
+                    reason=reason,
+                    custom_message=candidate_message,
+                    company=company,
+                )
+                if notification_sent:
+                    audit.log(
+                        "notification_sent",
+                        actor=context_row.get("recruiter_email", "") or "",
+                        candidate_email=candidate_email,
+                        event_id=event_id,
+                        payload={"type": "cancellation", "reason": reason},
+                        status="success",
+                    )
+
+        if notify_candidate and notification_sent:
+            st.success("Interview cancelled. Candidate notified via email.")
+        else:
+            st.success("Interview cancelled. Attendees should receive cancellation notices.")
+
     except GraphAPIError as e:
         st.error("Cancel failed.")
         st.json(e.response_json)
         audit.log(
-            "graph_cancel_failed",
+            "interview_cancel_failed",
             actor=context_row.get("recruiter_email", "") or "",
             candidate_email=context_row.get("candidate_email", "") or "",
             hiring_manager_email=context_row.get("hiring_manager_email", "") or "",
