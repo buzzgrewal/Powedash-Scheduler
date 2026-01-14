@@ -88,6 +88,15 @@ class CompanyConfig:
         return f"{self.name} Talent Acquisition Team"
 
 
+@dataclass
+class LayoutConfig:
+    """Layout and display configuration for UI branding."""
+    show_sidebar: bool
+    show_footer: bool
+    show_powered_by: bool
+    header_style: str  # "full", "compact", "minimal"
+
+
 def validate_email(email: str, field_name: str = "email") -> str:
     """Validate email format. Returns cleaned email or raises ValidationError."""
     if not email:
@@ -253,6 +262,33 @@ def get_audit_log_path() -> str:
     return get_secret("audit_log_path", "audit_log.db")
 
 
+def _get_branding_settings_path() -> str:
+    """Get path for persistent branding settings file."""
+    return get_secret("branding_settings_path", "branding_settings.json")
+
+
+def _load_branding_settings() -> Dict[str, Any]:
+    """Load branding settings from persistent storage."""
+    path = _get_branding_settings_path()
+    try:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_branding_settings(settings: Dict[str, Any]) -> None:
+    """Save branding settings to persistent storage."""
+    path = _get_branding_settings_path()
+    try:
+        with open(path, 'w') as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        st.warning(f"Could not save branding settings: {e}")
+
+
 def get_graph_config() -> Optional[GraphConfig]:
     tenant_id = get_secret("graph_tenant_id")
     client_id = get_secret("graph_client_id")
@@ -271,16 +307,96 @@ def get_graph_config() -> Optional[GraphConfig]:
 
 def get_company_config() -> CompanyConfig:
     """
-    Load company branding configuration from secrets.
-    Falls back to sensible defaults if not configured.
+    Load company branding configuration.
+    Checks session state for user overrides first, then falls back to secrets.
     """
+    # Check session state for user customizations (if initialized)
+    custom_name = st.session_state.get("custom_company_name") if hasattr(st, "session_state") else None
+    custom_logo = st.session_state.get("custom_logo_data") if hasattr(st, "session_state") else None
+    custom_color = st.session_state.get("custom_primary_color") if hasattr(st, "session_state") else None
+
     return CompanyConfig(
-        name=get_secret("company_name", "PowerDash HR"),
-        logo_url=get_secret("company_logo_url"),
-        primary_color=get_secret("company_primary_color", "#0066CC"),
+        name=custom_name or get_secret("company_name", "PowerDash HR"),
+        logo_url=custom_logo or get_secret("company_logo_url"),
+        primary_color=custom_color or get_secret("company_primary_color", "#0066CC"),
         website=get_secret("company_website"),
         sender_email=get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"),
     )
+
+
+def get_layout_config() -> LayoutConfig:
+    """Load layout configuration from secrets for UI branding."""
+    return LayoutConfig(
+        show_sidebar=get_secret("show_sidebar", False),
+        show_footer=get_secret("show_footer", True),
+        show_powered_by=get_secret("show_powered_by", True),
+        header_style=get_secret("header_style", "full"),
+    )
+
+
+def _lighten_color(hex_color: str, factor: float) -> str:
+    """Lighten a hex color by mixing with white."""
+    hex_color = hex_color.lstrip('#')
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    r = int(r + (255 - r) * factor)
+    g = int(g + (255 - g) * factor)
+    b = int(b + (255 - b) * factor)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _darken_color(hex_color: str, factor: float) -> str:
+    """Darken a hex color."""
+    hex_color = hex_color.lstrip('#')
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    r = int(r * (1 - factor))
+    g = int(g * (1 - factor))
+    b = int(b * (1 - factor))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _get_logo_src(path_or_url: Optional[str]) -> Optional[str]:
+    """Convert a local file path or URL to a src attribute value for img tags.
+
+    For local files, returns a base64 data URL.
+    For URLs (http/https), returns the URL as-is.
+    Returns None if path is None or file doesn't exist.
+    """
+    if not path_or_url:
+        return None
+
+    # If it's a URL, return as-is
+    if path_or_url.startswith(('http://', 'https://')):
+        return path_or_url
+
+    # For local files, convert to base64 data URL
+    try:
+        # Handle relative paths from app directory
+        if not os.path.isabs(path_or_url):
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            path_or_url = os.path.join(app_dir, path_or_url)
+
+        if not os.path.exists(path_or_url):
+            return None
+
+        with open(path_or_url, 'rb') as f:
+            data = f.read()
+
+        # Determine MIME type from extension
+        ext = os.path.splitext(path_or_url)[1].lower()
+        mime_types = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.svg': 'image/svg+xml',
+            '.ico': 'image/x-icon',
+        }
+        mime_type = mime_types.get(ext, 'image/png')
+
+        b64 = base64.b64encode(data).decode('utf-8')
+        return f"data:{mime_type};base64,{b64}"
+    except Exception:
+        return None
 
 
 def graph_enabled() -> bool:
@@ -641,10 +757,26 @@ def ensure_session_state() -> None:
         "rescheduling_interview_id": None,  # ID of interview being rescheduled (for confirmation dialog)
         "viewing_interview_history": None,  # Event ID for viewing history
         "interview_status_filter": "All",  # Status filter for interviews list
+        # Branding customization (overrides secrets) - loaded from persistent storage
+        "custom_company_name": None,  # Override company name from secrets
+        "custom_logo_data": None,  # Base64 encoded logo data
+        "custom_primary_color": None,  # Override primary brand color
+        "custom_background_color": None,  # Override background color
+        "_branding_loaded": False,  # Track if branding was loaded from file
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+    # Load persistent branding settings on first run
+    if not st.session_state.get("_branding_loaded"):
+        saved = _load_branding_settings()
+        if saved:
+            st.session_state["custom_company_name"] = saved.get("company_name")
+            st.session_state["custom_logo_data"] = saved.get("logo_data")
+            st.session_state["custom_primary_color"] = saved.get("primary_color")
+            st.session_state["custom_background_color"] = saved.get("background_color")
+        st.session_state["_branding_loaded"] = True
 
 
 def format_slot_label(slot: Dict[str, str]) -> str:
@@ -1718,19 +1850,382 @@ def _build_ics(
 
 
 # ----------------------------
-# Streamlit UI
+# Streamlit UI - Branding Components
 # ----------------------------
+
+def _apply_brand_theme(company: CompanyConfig, background_color: Optional[str] = None) -> None:
+    """Apply client's brand colors to UI elements via CSS."""
+    primary = company.primary_color
+    primary_light = _lighten_color(primary, 0.9)
+    primary_dark = _darken_color(primary, 0.2)
+
+    # Background color CSS (only if custom color is set)
+    bg_css = ""
+    if background_color:
+        bg_css = f"""
+/* Custom background color */
+.stApp, [data-testid="stAppViewContainer"] {{
+    background-color: {background_color} !important;
+}}
+.stMain, [data-testid="stMain"], .main .block-container {{
+    background-color: {background_color} !important;
+}}
+"""
+
+    css = f"""<style>
+{bg_css}
+/* Primary buttons */
+.stButton > button[kind="primary"], .stButton > button[data-testid="baseButton-primary"] {{
+    background-color: {primary} !important;
+    border-color: {primary} !important;
+}}
+.stButton > button[kind="primary"]:hover, .stButton > button[data-testid="baseButton-primary"]:hover {{
+    background-color: {primary_dark} !important;
+    border-color: {primary_dark} !important;
+}}
+/* All buttons hover effect */
+.stButton > button:hover {{
+    border-color: {primary} !important;
+}}
+/* Selected tabs */
+.stTabs [data-baseweb="tab-list"] button[aria-selected="true"] {{
+    border-bottom-color: {primary} !important;
+    color: {primary} !important;
+}}
+/* Tab highlight bar */
+.stTabs [data-baseweb="tab-highlight"] {{
+    background-color: {primary} !important;
+}}
+/* Links */
+a {{ color: {primary}; }}
+a:hover {{ color: {primary_dark}; }}
+/* Progress bars */
+.stProgress > div > div > div {{
+    background-color: {primary} !important;
+}}
+/* Selectbox/multiselect highlight */
+[data-baseweb="select"] [aria-selected="true"], [data-baseweb="menu"] [aria-selected="true"] {{
+    background-color: {primary_light} !important;
+}}
+/* Checkbox and radio when checked */
+.stCheckbox [data-testid="stCheckbox"] input:checked + div {{
+    background-color: {primary} !important;
+    border-color: {primary} !important;
+}}
+/* Slider */
+.stSlider [data-testid="stThumbValue"], .stSlider [data-baseweb="slider"] div[role="slider"] {{
+    background-color: {primary} !important;
+}}
+/* Sidebar accent */
+[data-testid="stSidebar"] {{
+    border-right: 3px solid {primary};
+}}
+/* Custom branded section class */
+.branded-section {{
+    border-left: 4px solid {primary};
+    padding-left: 16px;
+    margin: 16px 0;
+}}
+</style>"""
+    st.markdown(css, unsafe_allow_html=True)
+
+
+def _render_header_full(company: CompanyConfig) -> None:
+    """Render full header with logo and powered-by badge."""
+    css = """<style>
+.branded-header { display: flex; align-items: center; justify-content: space-between; padding: 1rem 0; border-bottom: 2px solid #f0f0f0; margin-bottom: 1.5rem; }
+.client-branding { display: flex; align-items: center; gap: 16px; }
+.client-logo { max-height: 50px; max-width: 180px; object-fit: contain; }
+.app-title { font-size: 1.5rem; font-weight: 600; color: #333; margin: 0; }
+.powered-by { display: flex; align-items: center; gap: 8px; font-size: 0.75rem; color: #888; }
+.powerdash-logo { height: 20px; opacity: 0.7; }
+</style>"""
+    st.markdown(css, unsafe_allow_html=True)
+
+    client_logo_html = ""
+    client_logo_src = _get_logo_src(company.logo_url)
+    if client_logo_src:
+        client_logo_html = f'<img src="{client_logo_src}" class="client-logo" alt="{company.name}" />'
+
+    powerdash_logo_path = get_secret("powerdash_logo_url", "logo.png")
+    powerdash_logo_src = _get_logo_src(powerdash_logo_path)
+    layout = get_layout_config()
+
+    powered_by_html = ""
+    if layout.show_powered_by and powerdash_logo_src:
+        powered_by_html = f'<div class="powered-by"><span>Powered by</span><img src="{powerdash_logo_src}" class="powerdash-logo" alt="PowerDash" /></div>'
+
+    header_html = f'<div class="branded-header"><div class="client-branding">{client_logo_html}<h1 class="app-title">{company.name} Interview Scheduler</h1></div>{powered_by_html}</div>'
+
+    st.markdown(header_html, unsafe_allow_html=True)
+
+
+def _render_header_compact(company: CompanyConfig) -> None:
+    """Render compact single-line header."""
+    logo_html = ""
+    client_logo_src = _get_logo_src(company.logo_url)
+    if client_logo_src:
+        logo_html = f'<img src="{client_logo_src}" style="height: 32px; margin-right: 12px;" />'
+
+    layout = get_layout_config()
+    powered_by_text = '<span style="font-size: 0.7rem; color: #999;">Powered by PowerDash</span>' if layout.show_powered_by else ''
+
+    html = f'<div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee; margin-bottom: 16px;"><div style="display: flex; align-items: center;">{logo_html}<span style="font-size: 1.1rem; font-weight: 600;">{company.name} Scheduler</span></div>{powered_by_text}</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _render_header_minimal(company: CompanyConfig) -> None:
+    """Render minimal text-only header."""
+    html = f'<div style="padding: 4px 0; margin-bottom: 12px;"><span style="font-size: 1rem; color: #333;">{company.name}</span><span style="font-size: 0.8rem; color: #999; margin-left: 8px;">Interview Scheduler</span></div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _render_branded_header(company: CompanyConfig) -> None:
+    """Render header based on configured style."""
+    layout = get_layout_config()
+
+    if layout.header_style == "compact":
+        _render_header_compact(company)
+    elif layout.header_style == "minimal":
+        _render_header_minimal(company)
+    else:
+        _render_header_full(company)
+
+
+def _render_footer() -> None:
+    """Render footer with PowerDash branding and links."""
+    st.markdown("---")
+
+    css = """<style>
+.app-footer { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; color: #888; font-size: 0.8rem; }
+.footer-left { display: flex; align-items: center; gap: 8px; }
+.footer-logo { height: 18px; opacity: 0.6; }
+.footer-links a { color: #888; text-decoration: none; margin-left: 16px; }
+.footer-links a:hover { color: #555; }
+</style>"""
+    st.markdown(css, unsafe_allow_html=True)
+
+    powerdash_logo_path = get_secret("powerdash_logo_url", "logo.png")
+    powerdash_logo_src = _get_logo_src(powerdash_logo_path)
+    current_year = datetime.now().year
+
+    logo_html = f'<img src="{powerdash_logo_src}" class="footer-logo" alt="PowerDash" />' if powerdash_logo_src else ''
+    footer_html = f'<div class="app-footer"><div class="footer-left">{logo_html}<span>&copy; {current_year} PowerDash HR. All rights reserved.</span></div><div class="footer-links"><a href="https://powerdashhr.com/support" target="_blank">Support</a><a href="https://powerdashhr.com/privacy" target="_blank">Privacy</a></div></div>'
+
+    st.markdown(footer_html, unsafe_allow_html=True)
+
+
+def _save_current_branding() -> None:
+    """Save current branding settings from session state to persistent storage."""
+    settings = {
+        "company_name": st.session_state.get("custom_company_name"),
+        "logo_data": st.session_state.get("custom_logo_data"),
+        "primary_color": st.session_state.get("custom_primary_color"),
+        "background_color": st.session_state.get("custom_background_color"),
+    }
+    # Only save if at least one setting is customized
+    if any(v is not None for v in settings.values()):
+        _save_branding_settings(settings)
+    else:
+        # Remove the file if all settings are default
+        path = _get_branding_settings_path()
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
+def _render_branding_sidebar() -> None:
+    """Render sidebar with branding customization settings."""
+    with st.sidebar:
+        st.markdown("### Settings")
+
+        # Company name customization
+        default_name = get_secret("company_name", "PowerDash HR")
+        current_name = st.session_state.get("custom_company_name") or default_name
+
+        new_name = st.text_input(
+            "Company Name",
+            value=current_name,
+            key="branding_name_input",
+            help="Customize the company name displayed in the header"
+        )
+
+        if new_name != current_name:
+            if new_name and new_name != default_name:
+                st.session_state["custom_company_name"] = new_name
+            elif new_name == default_name:
+                st.session_state["custom_company_name"] = None
+            _save_current_branding()
+            st.rerun()
+
+        st.markdown("---")
+
+        # Logo upload
+        st.markdown("**Company Logo**")
+
+        # Show current logo if set
+        current_logo = st.session_state.get("custom_logo_data")
+        if current_logo:
+            st.image(current_logo, width=150)
+            if st.button("Remove Logo", key="remove_logo_btn"):
+                st.session_state["custom_logo_data"] = None
+                _save_current_branding()
+                st.rerun()
+        else:
+            default_logo_path = get_secret("company_logo_url")
+            if default_logo_path:
+                logo_src = _get_logo_src(default_logo_path)
+                if logo_src:
+                    st.image(logo_src, width=150)
+                    st.caption("Default logo from settings")
+
+        uploaded_logo = st.file_uploader(
+            "Upload New Logo",
+            type=["png", "jpg", "jpeg", "gif", "svg"],
+            key="logo_uploader",
+            help="Upload a company logo (PNG, JPG, GIF, or SVG)"
+        )
+
+        if uploaded_logo is not None:
+            # Convert to base64 data URL
+            data = uploaded_logo.read()
+            ext = os.path.splitext(uploaded_logo.name)[1].lower()
+            mime_types = {
+                '.png': 'image/png',
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.gif': 'image/gif',
+                '.svg': 'image/svg+xml',
+            }
+            mime_type = mime_types.get(ext, 'image/png')
+            b64 = base64.b64encode(data).decode('utf-8')
+            data_url = f"data:{mime_type};base64,{b64}"
+
+            st.session_state["custom_logo_data"] = data_url
+            _save_current_branding()
+            st.rerun()
+
+        st.markdown("---")
+
+        # Brand color customization
+        st.markdown("**Brand Color**")
+
+        default_color = get_secret("company_primary_color", "#0066CC")
+        current_color = st.session_state.get("custom_primary_color") or default_color
+
+        # Show color preview with computed variants
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            new_color = st.color_picker(
+                "Primary",
+                value=current_color,
+                key="brand_color_picker",
+                help="Main brand color for buttons, links, and accents"
+            )
+        with col2:
+            light_color = _lighten_color(current_color, 0.9)
+            dark_color = _darken_color(current_color, 0.2)
+            st.markdown(f'<div style="display:flex;gap:4px;margin-top:26px;"><div style="width:24px;height:24px;background:{current_color};border-radius:4px;" title="Primary"></div><div style="width:24px;height:24px;background:{light_color};border-radius:4px;" title="Light"></div><div style="width:24px;height:24px;background:{dark_color};border-radius:4px;" title="Dark"></div></div>', unsafe_allow_html=True)
+            st.caption("Primary · Light · Dark")
+
+        if new_color != current_color:
+            if new_color != default_color:
+                st.session_state["custom_primary_color"] = new_color
+            else:
+                st.session_state["custom_primary_color"] = None
+            _save_current_branding()
+            st.rerun()
+
+        # Background color
+        st.markdown("**Background Color**")
+        current_bg = st.session_state.get("custom_background_color")
+
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            # Default to white if not set
+            new_bg = st.color_picker(
+                "Background",
+                value=current_bg or "#FFFFFF",
+                key="bg_color_picker",
+                help="Page background color"
+            )
+        with col2:
+            if current_bg:
+                st.markdown(f'<div style="margin-top:26px;padding:8px;background:{current_bg};border:1px solid #ddd;border-radius:4px;font-size:11px;color:#666;">Custom</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div style="margin-top:26px;padding:8px;background:#f0f0f0;border-radius:4px;font-size:11px;color:#888;">Default</div>', unsafe_allow_html=True)
+
+        # Only save if changed from current (and not white which is default)
+        if current_bg and new_bg != current_bg:
+            if new_bg.upper() == "#FFFFFF":
+                st.session_state["custom_background_color"] = None
+            else:
+                st.session_state["custom_background_color"] = new_bg
+            _save_current_branding()
+            st.rerun()
+        elif not current_bg and new_bg.upper() != "#FFFFFF":
+            st.session_state["custom_background_color"] = new_bg
+            _save_current_branding()
+            st.rerun()
+
+        st.markdown("---")
+
+        # Reset to defaults button
+        if st.button("Reset to Defaults", key="reset_branding_btn"):
+            st.session_state["custom_company_name"] = None
+            st.session_state["custom_logo_data"] = None
+            st.session_state["custom_primary_color"] = None
+            st.session_state["custom_background_color"] = None
+            _save_current_branding()
+            st.rerun()
+
+        # PowerDash branding at bottom
+        st.markdown("---")
+        powerdash_logo_src = _get_logo_src(get_secret("powerdash_logo_url", "logo.png"))
+        if powerdash_logo_src:
+            st.image(powerdash_logo_src, width=100)
+        st.caption("Powered by PowerDash HR")
+
+
+# ----------------------------
+# Streamlit UI - Main App
+# ----------------------------
+
 def main() -> None:
-    st.set_page_config(page_title="PowerDash Interview Scheduler", layout="wide")
+    # Page config must come first - use secrets for initial title
+    base_name = get_secret("company_name", "PowerDash HR")
+    st.set_page_config(
+        page_title=f"{base_name} Interview Scheduler",
+        page_icon=get_secret("company_favicon_url", "🗓️"),
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+
     ensure_session_state()
+
+    # Render branding settings sidebar
+    _render_branding_sidebar()
+
+    # Now get company config with any session state overrides
+    company = get_company_config()
+    layout = get_layout_config()
+    background_color = st.session_state.get("custom_background_color")
 
     audit = AuditLog(get_audit_log_path())
 
-    st.title("PowerDash Interview Scheduler")
+    # Apply brand theme CSS and render header
+    _apply_brand_theme(company, background_color)
+    _render_branded_header(company)
 
-    tab_new, tab_inbox, tab_invites, tab_audit, tab_diag = st.tabs(
-        ["New Scheduling Request", "Scheduler Inbox", "Calendar Invites", "Audit Log", "Graph Diagnostics"]
-    )
+    tab_new, tab_inbox, tab_invites, tab_audit, tab_diag = st.tabs([
+        "📝 New Request",
+        "📥 Inbox",
+        "📅 Interviews",
+        "📜 Audit Log",
+        "🔧 Diagnostics",
+    ])
 
     # ========= TAB: New Scheduling Request =========
     with tab_new:
@@ -2742,6 +3237,10 @@ def main() -> None:
                     st.error(f"{e}")
                     st.json(e.response_json)
                     audit.log("graph_dummy_event_failed", payload=e.response_json, status="failed", error_message=str(e))
+
+    # Render footer if enabled
+    if layout.show_footer:
+        _render_footer()
 
 
 # ----------------------------
