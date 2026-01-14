@@ -24,6 +24,14 @@ from graph_client import GraphClient, GraphConfig, GraphAPIError, GraphAuthError
 from audit_log import AuditLog, LogLevel, log_structured, InterviewStatus
 from ics_utils import ICSInvite, stable_uid, ICSValidationError, create_ics_from_interview, generate_cancellation_ics
 from timezone_utils import to_utc, from_utc, iso_utc, is_valid_timezone, safe_zoneinfo
+from export_utils import (
+    export_interviews_csv,
+    export_audit_log_csv,
+    format_audit_entry_human,
+    filter_interviews_for_export,
+    filter_audit_entries,
+    AUDIT_ACTION_DESCRIPTIONS,
+)
 
 
 # ----------------------------
@@ -763,6 +771,12 @@ def ensure_session_state() -> None:
         "custom_primary_color": None,  # Override primary brand color
         "custom_background_color": None,  # Override background color
         "_branding_loaded": False,  # Track if branding was loaded from file
+        # Audit log view state
+        "audit_view_mode": "Table",  # "Timeline" | "Table" | "Raw"
+        "audit_entry_limit": 300,  # Entry limit selector
+        "audit_action_filter": "All",  # Action type filter
+        "audit_status_filter": "All",  # Status filter (All/Success/Failed)
+        "audit_search": "",  # Search term
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2848,6 +2862,165 @@ def main() -> None:
             }
             return status_badges.get(status.lower() if status else "", status or "Unknown")
 
+        # --- Audit Log Rendering Functions ---
+
+        def _render_audit_timeline(entries: List[Dict[str, Any]]):
+            """Render audit log as timeline view with status indicators."""
+            if not entries:
+                st.info("No audit entries to display.")
+                return
+
+            # Action color mapping
+            action_colors = {
+                "graph_create_event": "#28a745",      # Green - success
+                "graph_create_group_event": "#28a745",
+                "interview_rescheduled": "#ffc107",   # Yellow - change
+                "graph_reschedule_event": "#ffc107",
+                "interview_cancelled": "#dc3545",     # Red - cancellation
+                "graph_cancel_event": "#dc3545",
+                "notification_sent": "#17a2b8",       # Blue - notification
+                "candidate_notification_sent": "#17a2b8",
+                "email_sent": "#17a2b8",
+                "graph_sent_scheduling_email": "#17a2b8",
+            }
+            default_color = "#6c757d"  # Gray
+
+            current_date = None
+
+            for entry in entries:
+                # Date separator
+                timestamp = entry.get("timestamp", "")
+                entry_date = timestamp[:12] if timestamp else ""
+
+                if entry_date and entry_date != current_date:
+                    current_date = entry_date
+                    st.markdown(f"### {current_date}")
+
+                # Get color for this action
+                action_code = entry.get("action_code", "")
+                color = action_colors.get(action_code, default_color)
+
+                # Status icon
+                status = entry.get("status", "")
+                if status == "success":
+                    status_icon = "✅"
+                elif status == "failed":
+                    status_icon = "❌"
+                else:
+                    status_icon = "ℹ️"
+
+                # Entry card
+                with st.container():
+                    col_status, col_content = st.columns([0.5, 11.5])
+
+                    with col_status:
+                        st.markdown(f"### {status_icon}")
+
+                    with col_content:
+                        st.markdown(f"**{entry.get('action_display', '')}**")
+                        st.markdown(entry.get("summary", ""))
+
+                        # Meta line
+                        time_part = timestamp[13:] if len(timestamp) > 13 else ""
+                        meta = f"_{time_part} by {entry.get('actor_display', 'System')}_"
+                        st.caption(meta)
+
+                        # Details if present
+                        if entry.get("details"):
+                            st.caption(entry["details"])
+
+                        # Expandable raw data
+                        with st.expander("View details"):
+                            st.json(entry.get("raw", {}))
+
+                    st.markdown("---")
+
+        def _render_audit_table(entries: List[Dict[str, Any]]):
+            """Render audit log as formatted table view."""
+            if not entries:
+                st.info("No audit entries to display.")
+                return
+
+            # Status icon mapping
+            def get_status_icon(status: str) -> str:
+                if status == "success":
+                    return "✅"
+                elif status == "failed":
+                    return "❌"
+                return "ℹ️"
+
+            table_data = [
+                {
+                    "Time": e.get("timestamp", ""),
+                    "Status": get_status_icon(e.get("status", "")),
+                    "Action": e.get("action_display", ""),
+                    "Summary": e.get("summary", ""),
+                    "Actor": e.get("actor_display", ""),
+                }
+                for e in entries
+            ]
+
+            st.dataframe(
+                table_data,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Status": st.column_config.TextColumn(width="small"),
+                    "Summary": st.column_config.TextColumn(width="large"),
+                }
+            )
+
+            # Expandable row details
+            with st.expander("View entry details"):
+                idx = st.number_input(
+                    "Entry index (0 = most recent)",
+                    min_value=0,
+                    max_value=max(0, len(entries) - 1),
+                    value=0,
+                    key="audit_table_row_idx"
+                )
+                selected = entries[int(idx)]
+                st.markdown(f"**{selected.get('action_display', '')}**")
+                st.markdown(selected.get("summary", ""))
+                if selected.get("details"):
+                    st.caption(selected["details"])
+                st.json(selected.get("raw", {}))
+
+        def _render_audit_raw(entries: List[Dict[str, Any]]):
+            """Render audit log as raw dataframe (original view)."""
+            if not entries:
+                st.info("No audit entries to display.")
+                return
+
+            st.dataframe(
+                [
+                    {
+                        "timestamp_utc": r.get("timestamp_utc", ""),
+                        "action": r.get("action", ""),
+                        "status": r.get("status", ""),
+                        "candidate": r.get("candidate_email", ""),
+                        "hiring_manager": r.get("hiring_manager_email", ""),
+                        "event_id": r.get("event_id", ""),
+                        "error": (r.get("error_message", "")[:80] + "…")
+                            if r.get("error_message") and len(r.get("error_message", "")) > 80
+                            else (r.get("error_message") or ""),
+                    }
+                    for r in entries
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            with st.expander("Show raw payload for a row"):
+                idx = st.number_input(
+                    "Row index (0 = most recent)",
+                    min_value=0,
+                    max_value=max(0, len(entries) - 1),
+                    value=0,
+                    key="audit_raw_row_idx"
+                )
+                st.json(entries[int(idx)])
+
         def _render_interview_history(audit_instance: AuditLog, event_id: str):
             """Display complete history for selected interview."""
             st.markdown("#### Interview History")
@@ -2937,6 +3110,85 @@ def main() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+
+            # Export controls section
+            with st.expander("Export Data", expanded=False):
+                col_tz, col_fields, col_status = st.columns(3)
+
+                with col_tz:
+                    export_tz = st.selectbox(
+                        "Timezone",
+                        options=_common_timezones(),
+                        index=_tz_index(get_default_timezone()),
+                        key="export_interviews_tz"
+                    )
+
+                with col_fields:
+                    include_all_fields = st.checkbox(
+                        "Include all fields",
+                        value=False,
+                        help="Include extended fields like Teams links, Event IDs",
+                        key="export_all_fields"
+                    )
+
+                with col_status:
+                    export_status_filter = st.multiselect(
+                        "Filter by status",
+                        options=["Pending", "Confirmed", "Rescheduled", "Cancelled", "Completed"],
+                        default=["Pending", "Confirmed", "Rescheduled"],
+                        key="export_status_filter"
+                    )
+
+                col_date_range, col_custom = st.columns(2)
+
+                with col_date_range:
+                    date_range = st.selectbox(
+                        "Date range",
+                        options=["All time", "Today", "This week", "This month", "Last 30 days", "Custom"],
+                        key="export_date_range"
+                    )
+
+                date_from = None
+                date_to = None
+                if date_range == "Custom":
+                    with col_custom:
+                        col_from, col_to = st.columns(2)
+                        with col_from:
+                            date_from = st.date_input("From", key="export_date_from")
+                        with col_to:
+                            date_to = st.date_input("To", key="export_date_to")
+
+                # Filter and generate export
+                filtered_interviews = filter_interviews_for_export(
+                    interviews,
+                    status_filter=export_status_filter if export_status_filter else None,
+                    date_range=date_range,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+
+                col_info, col_download = st.columns([3, 1])
+
+                with col_info:
+                    st.caption(f"{len(filtered_interviews)} interview(s) match the filters")
+
+                with col_download:
+                    if filtered_interviews:
+                        csv_bytes = export_interviews_csv(
+                            filtered_interviews,
+                            display_timezone=export_tz,
+                            include_all_fields=include_all_fields,
+                        )
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        st.download_button(
+                            label="Download CSV",
+                            data=csv_bytes,
+                            file_name=f"interviews_export_{timestamp}.csv",
+                            mime="text/csv",
+                            key="download_interviews_csv"
+                        )
+                    else:
+                        st.button("Download CSV", disabled=True, key="download_disabled")
 
             st.markdown("----")
 
@@ -3157,31 +3409,98 @@ def main() -> None:
     # ========= TAB: Audit Log =========
     with tab_audit:
         st.subheader("Audit Log")
-        st.caption("Append-only log of scheduling actions.")
-        rows = audit.list_recent_audit(limit=300)
-        if not rows:
-            st.info("No audit entries yet.")
-        else:
-            st.dataframe(
-                [
-                    {
-                        "timestamp_utc": r["timestamp_utc"],
-                        "action": r["action"],
-                        "status": r["status"],
-                        "candidate": r["candidate_email"],
-                        "hiring_manager": r["hiring_manager_email"],
-                        "event_id": r["event_id"],
-                        "error": (r["error_message"][:80] + "…") if r.get("error_message") and len(r["error_message"]) > 80 else (r.get("error_message") or ""),
-                    }
-                    for r in rows
-                ],
-                use_container_width=True,
-                hide_index=True,
+        st.caption("Complete history of all scheduling actions.")
+
+        # Controls row
+        col_view, col_limit = st.columns([3, 1])
+
+        with col_view:
+            view_mode = st.radio(
+                "View",
+                options=["Table", "Timeline", "Raw"],
+                horizontal=True,
+                key="audit_view_mode"
             )
 
-            with st.expander("Show raw payload for a row"):
-                idx = st.number_input("Row index (0 = most recent)", min_value=0, max_value=max(0, len(rows) - 1), value=0)
-                st.json(rows[int(idx)])
+        with col_limit:
+            entry_limit = st.selectbox(
+                "Entries",
+                options=[100, 300, 500],
+                index=1,
+                key="audit_entry_limit"
+            )
+
+        # Filter controls
+        col_action, col_status, col_search = st.columns([2, 1, 2])
+
+        with col_action:
+            action_options = ["All"] + sorted(set(AUDIT_ACTION_DESCRIPTIONS.values()))
+            action_filter = st.selectbox(
+                "Filter by action",
+                options=action_options,
+                key="audit_action_filter"
+            )
+
+        with col_status:
+            status_filter = st.selectbox(
+                "Status",
+                options=["All", "Success", "Failed"],
+                key="audit_status_filter"
+            )
+
+        with col_search:
+            audit_search = st.text_input(
+                "Search",
+                placeholder="candidate, role...",
+                key="audit_search"
+            )
+
+        # Fetch entries
+        raw_entries = audit.list_recent_audit(limit=entry_limit)
+
+        if not raw_entries:
+            st.info("No audit entries yet.")
+        else:
+            # Apply filters
+            filtered_entries = filter_audit_entries(
+                raw_entries,
+                action_filter=action_filter,
+                status_filter=status_filter,
+                search_term=audit_search,
+            )
+
+            if not filtered_entries:
+                st.warning("No entries match the current filters.")
+            else:
+                # Format entries for display
+                formatted_entries = [format_audit_entry_human(e) for e in filtered_entries]
+
+                # Export button
+                col_count, col_export = st.columns([3, 1])
+
+                with col_count:
+                    st.caption(f"Showing {len(formatted_entries)} of {len(raw_entries)} entries")
+
+                with col_export:
+                    csv_bytes = export_audit_log_csv(formatted_entries)
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    st.download_button(
+                        label="Export CSV",
+                        data=csv_bytes,
+                        file_name=f"audit_log_{timestamp}.csv",
+                        mime="text/csv",
+                        key="download_audit_csv"
+                    )
+
+                st.markdown("---")
+
+                # Render based on view mode
+                if view_mode == "Timeline":
+                    _render_audit_timeline(formatted_entries)
+                elif view_mode == "Table":
+                    _render_audit_table(formatted_entries)
+                else:
+                    _render_audit_raw(filtered_entries)
 
     # ========= TAB: Graph Diagnostics =========
     with tab_diag:
