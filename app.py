@@ -4594,6 +4594,71 @@ def _handle_create_invite(
         )
 
 
+def _extract_candidate_name_from_context(context_row: Dict[str, Any]) -> str:
+    """
+    Extract candidate name from interview context row.
+
+    Tries candidates_json first (for group interviews), then falls back to
+    parsing from candidate_email if no name is found.
+    """
+    # Try to get name from candidates_json (for group/multi-candidate interviews)
+    candidates_json = context_row.get("candidates_json")
+    if candidates_json:
+        try:
+            candidates = json.loads(candidates_json)
+            if candidates and isinstance(candidates, list) and len(candidates) > 0:
+                first_candidate = candidates[0]
+                if isinstance(first_candidate, dict) and first_candidate.get("name"):
+                    return first_candidate["name"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    # Fall back to empty string - email will be used as fallback in templates
+    return ""
+
+
+def _format_interview_time_for_candidate(
+    utc_time_str: str,
+    candidate_timezone: Optional[str],
+    display_timezone: Optional[str] = None,
+) -> str:
+    """
+    Format interview time in candidate's timezone for notifications.
+
+    Args:
+        utc_time_str: ISO format UTC time string
+        candidate_timezone: Candidate's preferred timezone
+        display_timezone: Fallback display timezone
+
+    Returns:
+        Human-readable formatted time string
+    """
+    from timezone_utils import from_utc, is_valid_timezone
+
+    # Determine which timezone to use
+    tz_to_use = None
+    if candidate_timezone and is_valid_timezone(candidate_timezone):
+        tz_to_use = candidate_timezone
+    elif display_timezone and is_valid_timezone(display_timezone):
+        tz_to_use = display_timezone
+
+    try:
+        # Parse the UTC time
+        dt_utc = datetime.fromisoformat(utc_time_str.replace("+00:00", "").replace("Z", ""))
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+
+        if tz_to_use:
+            # Convert to candidate/display timezone
+            dt_local = from_utc(dt_utc, tz_to_use)
+            tz_abbrev = dt_local.strftime("%Z") or tz_to_use
+            return dt_local.strftime(f"%A, %B %d, %Y at %I:%M %p {tz_abbrev}")
+        else:
+            # Fall back to UTC display
+            return dt_utc.strftime("%A, %B %d, %Y at %I:%M %p UTC")
+    except Exception:
+        return utc_time_str
+
+
 def _send_cancellation_email(
     client: GraphClient,
     candidate_email: str,
@@ -4717,14 +4782,12 @@ def _handle_reschedule(
     start_utc = to_utc(start_local)
     end_utc = to_utc(end_local)
 
-    # Store old time for notification
+    # Store old time for notification - use candidate timezone for better UX
     old_time_str = context_row.get("start_utc", "")
-    try:
-        old_dt = datetime.fromisoformat(old_time_str.replace("+00:00", "").replace("Z", ""))
-        old_time_formatted = old_dt.strftime("%A, %B %d, %Y at %I:%M %p UTC")
-    except Exception:
-        old_time_formatted = old_time_str
+    candidate_tz = context_row.get("candidate_timezone") or context_row.get("display_timezone") or tz_name
+    old_time_formatted = _format_interview_time_for_candidate(old_time_str, candidate_tz, tz_name)
 
+    # Format new time in candidate's timezone
     new_time_formatted = start_local.strftime("%A, %B %d, %Y at %I:%M %p") + f" ({tz_name})"
 
     patch = {
@@ -4772,10 +4835,12 @@ def _handle_reschedule(
             company = get_company_config()
             candidate_email = context_row.get("candidate_email", "")
             if candidate_email:
+                # Extract candidate name from context (candidates_json or fallback)
+                candidate_name = _extract_candidate_name_from_context(context_row)
                 notification_sent = _send_reschedule_email(
                     client=client,
                     candidate_email=candidate_email,
-                    candidate_name="",  # Could be enhanced to parse from candidates_json
+                    candidate_name=candidate_name,
                     role_title=context_row.get("role_title", ""),
                     old_time=old_time_formatted,
                     new_time=new_time_formatted,
@@ -4839,13 +4904,10 @@ def _handle_cancel(
         st.error("Graph is not configured.")
         return
 
-    # Format interview time for notification
+    # Format interview time for notification - use candidate timezone for better UX
     interview_time_str = context_row.get("start_utc", "")
-    try:
-        dt = datetime.fromisoformat(interview_time_str.replace("+00:00", "").replace("Z", ""))
-        interview_time_formatted = dt.strftime("%A, %B %d, %Y at %I:%M %p UTC")
-    except Exception:
-        interview_time_formatted = interview_time_str
+    candidate_tz = context_row.get("candidate_timezone") or context_row.get("display_timezone")
+    interview_time_formatted = _format_interview_time_for_candidate(interview_time_str, candidate_tz)
 
     try:
         # Delete the calendar event
@@ -4881,10 +4943,12 @@ def _handle_cancel(
             company = get_company_config()
             candidate_email = context_row.get("candidate_email", "")
             if candidate_email:
+                # Extract candidate name from context (candidates_json or fallback)
+                candidate_name = _extract_candidate_name_from_context(context_row)
                 notification_sent = _send_cancellation_email(
                     client=client,
                     candidate_email=candidate_email,
-                    candidate_name="",  # Could be enhanced to parse from candidates_json
+                    candidate_name=candidate_name,
                     role_title=context_row.get("role_title", ""),
                     interview_time=interview_time_formatted,
                     reason=reason,
