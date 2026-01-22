@@ -468,7 +468,7 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.2",
             temperature=0,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that returns strict JSON."},
@@ -697,7 +697,7 @@ TEXT TO PARSE:
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.2",
             temperature=0,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that returns strict JSON. Never include markdown formatting."},
