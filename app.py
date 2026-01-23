@@ -263,7 +263,7 @@ def get_secret(key: str, default: Any = None) -> Any:
 
 
 def get_default_timezone() -> str:
-    return get_secret("default_timezone", "Europe/London")
+    return get_secret("default_timezone", "UTC")
 
 
 def get_audit_log_path() -> str:
@@ -476,7 +476,7 @@ def image_to_base64(image: Image.Image) -> str:
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
-def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
+def parse_slots_from_image(image: Image.Image, interviewer_timezone: Optional[str] = None, display_timezone: Optional[str] = None) -> List[Dict[str, str]]:
     """
     Use OpenAI vision to parse free/busy calendar images into slots.
     Expected JSON format:
@@ -489,6 +489,19 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
     if not client:
         return []
 
+    # Build timezone instruction
+    tz_instruction = ""
+    if interviewer_timezone and display_timezone and interviewer_timezone != display_timezone:
+        tz_instruction = (
+            f"\n\nTIMEZONE CONVERSION:\n"
+            f"  The calendar is in the interviewer's timezone: {interviewer_timezone}.\n"
+            f"  Convert all extracted times to the display timezone: {display_timezone}.\n"
+            f"  For example, if the calendar shows 09:00 in {interviewer_timezone} and the display timezone is {display_timezone}, "
+            f"convert accordingly. Return all times in {display_timezone}.\n"
+        )
+    elif interviewer_timezone:
+        tz_instruction = f"\n\nThe calendar is in timezone: {interviewer_timezone}. Return times as shown (no conversion needed).\n"
+
     prompt = (
         "You are extracting FREE time slots from a calendar screenshot.\n"
         "Return ONLY valid JSON (no markdown) as a list of objects with keys:\n"
@@ -496,6 +509,13 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
         "  - start (HH:MM in 24-hour format)\n"
         "  - end (HH:MM in 24-hour format)\n"
         "  - inferred_tz (timezone abbreviation if visible, e.g. 'PST', 'EST', 'GMT', or null if not visible)\n\n"
+        "IMPORTANT RULES:\n"
+        "  1. Only extract slots within business hours: 08:00 to 18:00 (in the output timezone). "
+        "Clamp any slot that extends outside this range (e.g., 07:00–10:00 becomes 08:00–10:00).\n"
+        "  2. Treat all-day events marked as 'unavailable', 'blocked', 'busy', 'out of office', or 'OOO' "
+        "as FULLY BUSY for the entire day. Do NOT extract any free slots on those days.\n"
+        "  3. Exclude weekends (Saturday and Sunday) entirely. Do NOT return any slots on weekend days.\n\n"
+        f"{tz_instruction}"
         "Look for timezone indicators in:\n"
         "  - Calendar headers or footers\n"
         "  - Corner labels (e.g., 'Times shown in PST')\n"
@@ -533,10 +553,39 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
         valid_slots = []
         for s in slots:
             if isinstance(s, dict) and all(k in s for k in ("date", "start", "end")):
+                slot_date = str(s["date"])
+                slot_start = str(s["start"])
+                slot_end = str(s["end"])
+
+                # Exclude weekends
+                try:
+                    dt = datetime.strptime(slot_date, "%Y-%m-%d")
+                    if dt.weekday() >= 5:  # Saturday=5, Sunday=6
+                        continue
+                except ValueError:
+                    continue
+
+                # Clamp to business hours (08:00–18:00)
+                if slot_start < "08:00":
+                    slot_start = "08:00"
+                if slot_end > "18:00":
+                    slot_end = "18:00"
+
+                # Skip if slot is now invalid or too short (<30 min)
+                if slot_start >= slot_end:
+                    continue
+                try:
+                    start_dt = datetime.strptime(slot_start, "%H:%M")
+                    end_dt = datetime.strptime(slot_end, "%H:%M")
+                    if (end_dt - start_dt).seconds < 1800:  # 30 minutes
+                        continue
+                except ValueError:
+                    continue
+
                 slot_data = {
-                    "date": str(s["date"]),
-                    "start": str(s["start"]),
-                    "end": str(s["end"]),
+                    "date": slot_date,
+                    "start": slot_start,
+                    "end": slot_end,
                 }
                 # Preserve inferred timezone if present
                 if s.get("inferred_tz"):
@@ -2310,7 +2359,7 @@ def _render_footer() -> None:
     css = """<style>
 .app-footer { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; color: #888; font-size: 0.8rem; }
 .footer-left { display: flex; align-items: center; gap: 8px; }
-.footer-logo { height: 18px; opacity: 0.6; }
+.footer-logo { height: 36px; opacity: 0.6; }
 .footer-links a { color: #888; text-decoration: none; margin-left: 16px; }
 .footer-links a:hover { color: #555; }
 </style>"""
@@ -2516,18 +2565,20 @@ def main() -> None:
 
     ensure_session_state()
 
+    # Apply brand theme CSS immediately so all UI elements use brand colors
+    company = get_company_config()
+    background_color = st.session_state.get("custom_background_color")
+    _apply_brand_theme(company, background_color)
+
     # Render branding settings sidebar
     _render_branding_sidebar()
 
-    # Now get company config with any session state overrides
+    # Refresh company config in case sidebar changed it
     company = get_company_config()
     layout = get_layout_config()
     background_color = st.session_state.get("custom_background_color")
 
     audit = AuditLog(get_audit_log_path())
-
-    # Apply brand theme CSS and render header
-    _apply_brand_theme(company, background_color)
     _render_branded_header(company)
 
     tab_new, tab_inbox, tab_invites, tab_audit, tab_diag = st.tabs([
@@ -2603,6 +2654,19 @@ def main() -> None:
                                 _save_persisted_slots()
                                 st.rerun()
 
+                    # Interviewer timezone selector
+                    current_tz = interviewer.get("timezone", st.session_state["selected_timezone"])
+                    tz_options = _common_timezones()
+                    tz_idx = tz_options.index(current_tz) if current_tz in tz_options else 0
+                    interviewer_tz = st.selectbox(
+                        "Timezone",
+                        options=tz_options,
+                        index=tz_idx,
+                        key=f"interviewer_tz_{interviewer['id']}",
+                        help="The timezone of this interviewer's calendar"
+                    )
+                    interviewers[idx]["timezone"] = interviewer_tz
+
                     # File uploader
                     uploaded = st.file_uploader(
                         f"Calendar ({interviewer.get('name') or f'Interviewer {idx+1}'})",
@@ -2628,6 +2692,7 @@ def main() -> None:
                         if st.button(
                             f"Parse {interviewer.get('name') or f'Interviewer {idx+1}'}",
                             key=f"parse_single_{interviewer['id']}",
+                            type="primary",
                         ):
                             if not interviewer.get("name", "").strip():
                                 st.error("Name is required before parsing.")
@@ -2688,7 +2753,7 @@ def main() -> None:
             except:
                 pass
 
-            parse_btn = st.button("Parse All Availability", type="secondary")
+            parse_btn = st.button("Parse All Availability", type="primary")
 
             if parse_btn:
                 # Validate all interviewers have name and email
@@ -3893,7 +3958,7 @@ def main() -> None:
 # ----------------------------
 # Internal UI handlers
 # ----------------------------
-def _parse_availability_upload(upload) -> List[Dict[str, str]]:
+def _parse_availability_upload(upload, interviewer_timezone: Optional[str] = None, display_timezone: Optional[str] = None) -> List[Dict[str, str]]:
     data = upload.read()
     name = (upload.name or "").lower()
     slots: List[Dict[str, str]] = []
@@ -3901,7 +3966,7 @@ def _parse_availability_upload(upload) -> List[Dict[str, str]]:
     if name.endswith(".pdf"):
         imgs = pdf_to_images(data, max_pages=3)
         for img in imgs:
-            slots.extend(parse_slots_from_image(img))
+            slots.extend(parse_slots_from_image(img, interviewer_timezone, display_timezone))
 
     elif name.endswith(".docx"):
         # Strategy: Extract text + tables, then also check embedded images
@@ -3914,12 +3979,12 @@ def _parse_availability_upload(upload) -> List[Dict[str, str]]:
         # 2. Extract and parse embedded images (optional enhancement)
         embedded_images = docx_extract_images(data, max_images=3)
         for img in embedded_images:
-            slots.extend(parse_slots_from_image(img))
+            slots.extend(parse_slots_from_image(img, interviewer_timezone, display_timezone))
 
     else:
         # Assume image file (png, jpg, jpeg)
         img = Image.open(io.BytesIO(data)).convert("RGB")
-        slots.extend(parse_slots_from_image(img))
+        slots.extend(parse_slots_from_image(img, interviewer_timezone, display_timezone))
 
     # De-duplicate slots by (date, start, end) tuple
     uniq = {(s["date"], s["start"], s["end"]): s for s in slots}
@@ -3945,12 +4010,13 @@ def _parse_single_interviewer_availability(interviewer_idx: int) -> None:
     interviewer_name = interviewer.get("name") or f"Interviewer {interviewer.get('id', '?')}"
 
     # Parse this interviewer's file
+    interviewer_tz = interviewer.get("timezone", tz_name)
     existing_manual_slots = [s for s in interviewer.get("slots", []) if s.get("source") == "manual"]
 
     try:
         if interviewer.get("file"):
             interviewer["file"].seek(0)
-            uploaded_slots = _parse_availability_upload(interviewer["file"])
+            uploaded_slots = _parse_availability_upload(interviewer["file"], interviewer_tz, tz_name)
             for s in uploaded_slots:
                 s["source"] = "uploaded"
             interviewer["slots"] = _merge_slots(existing_manual_slots, uploaded_slots)
@@ -4017,13 +4083,14 @@ def _parse_all_panel_availability() -> None:
         # Get existing manual slots (preserve them)
         existing_manual_slots = [s for s in interviewer.get("slots", []) if s.get("source") == "manual"]
         total_manual += len(existing_manual_slots)
+        interviewer_tz = interviewer.get("timezone", tz_name)
 
         try:
             if interviewer.get("file"):
                 # Reset file position before reading
                 interviewer["file"].seek(0)
                 # Parse the uploaded file
-                uploaded_slots = _parse_availability_upload(interviewer["file"])
+                uploaded_slots = _parse_availability_upload(interviewer["file"], interviewer_tz, tz_name)
                 # Mark uploaded slots with source
                 for s in uploaded_slots:
                     s["source"] = "uploaded"
