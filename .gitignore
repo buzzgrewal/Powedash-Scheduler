@@ -7,6 +7,10 @@
 # Database
 *.db
 
+# Persistent app state
+parsed_slots.json
+branding_settings.json
+
 # Python
 __pycache__/
 *.py[cod]

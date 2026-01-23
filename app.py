@@ -270,6 +270,47 @@ def get_audit_log_path() -> str:
     return get_secret("audit_log_path", "audit_log.db")
 
 
+def _get_slots_path() -> str:
+    """Get path for persistent parsed slots file."""
+    return get_secret("slots_storage_path", "parsed_slots.json")
+
+
+def _load_persisted_slots() -> Dict[str, Any]:
+    """Load persisted slots from file. Returns dict with slots, intersections, and panel data."""
+    path = _get_slots_path()
+    try:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "slots" in data:
+                    return data
+    except Exception:
+        pass
+    return {"slots": [], "computed_intersections": [], "panel_interviewers": [], "next_interviewer_id": 1}
+
+
+def _save_persisted_slots() -> None:
+    """Save current slots and panel interviewer data to persistent storage."""
+    path = _get_slots_path()
+    try:
+        # Serialize panel_interviewers without the non-serializable 'file' field
+        panel = st.session_state.get("panel_interviewers", [])
+        serializable_panel = [
+            {k: v for k, v in interviewer.items() if k != "file"}
+            for interviewer in panel
+        ]
+        data = {
+            "slots": st.session_state.get("slots", []),
+            "computed_intersections": st.session_state.get("computed_intersections", []),
+            "panel_interviewers": serializable_panel,
+            "next_interviewer_id": st.session_state.get("next_interviewer_id", 1),
+        }
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
 def _get_branding_settings_path() -> str:
     """Get path for persistent branding settings file."""
     return get_secret("branding_settings_path", "branding_settings.json")
@@ -468,7 +509,7 @@ def parse_slots_from_image(image: Image.Image) -> List[Dict[str, str]]:
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-5.2",
+            model=get_secret("openai_model", "gpt-5.2"),
             temperature=0,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that returns strict JSON."},
@@ -697,7 +738,7 @@ TEXT TO PARSE:
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-5.2",
+            model=get_secret("openai_model", "gpt-5.2"),
             temperature=0,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that returns strict JSON. Never include markdown formatting."},
@@ -760,6 +801,8 @@ def ensure_session_state() -> None:
         "slot_filter_min_n": 1,  # Minimum N for "any_n" mode
         "computed_intersections": [],  # Intersection slots with availability metadata
         "editing_slot_index": None,  # Track which slot is being edited: (interviewer_idx, slot_idx) or None
+        "editing_parsed_slot_index": None,  # int index into session_state["slots"] or None
+        "adding_parsed_slot": False,  # Whether the add-slot form is visible
         # Interview management UI state
         "cancelling_interview_id": None,  # ID of interview being cancelled (for confirmation dialog)
         "rescheduling_interview_id": None,  # ID of interview being rescheduled (for confirmation dialog)
@@ -791,6 +834,22 @@ def ensure_session_state() -> None:
             st.session_state["custom_primary_color"] = saved.get("primary_color")
             st.session_state["custom_background_color"] = saved.get("background_color")
         st.session_state["_branding_loaded"] = True
+
+    # Load persisted slots on first run
+    if not st.session_state.get("_slots_loaded"):
+        saved_slots = _load_persisted_slots()
+        if saved_slots.get("slots"):
+            st.session_state["slots"] = saved_slots["slots"]
+            st.session_state["computed_intersections"] = saved_slots.get("computed_intersections", [])
+        if saved_slots.get("panel_interviewers"):
+            # Restore panel interviewers (add file=None since uploads don't persist)
+            restored_panel = [
+                {**interviewer, "file": None}
+                for interviewer in saved_slots["panel_interviewers"]
+            ]
+            st.session_state["panel_interviewers"] = restored_panel
+            st.session_state["next_interviewer_id"] = saved_slots.get("next_interviewer_id", 1)
+        st.session_state["_slots_loaded"] = True
 
 
 def format_slot_label(slot: Dict[str, str]) -> str:
@@ -861,6 +920,7 @@ def _add_manual_slot(interviewer_idx: int, slot_date, start_time, end_time) -> b
 
     existing_slots.append(new_slot)
     st.session_state["panel_interviewers"][interviewer_idx]["slots"] = existing_slots
+    _save_persisted_slots()
     st.success(f"Added slot: {format_slot_label(new_slot)}")
     return True
 
@@ -875,6 +935,7 @@ def _delete_interviewer_slot(interviewer_idx: int, slot_idx: int) -> None:
     if 0 <= slot_idx < len(slots):
         deleted = slots.pop(slot_idx)
         st.session_state["panel_interviewers"][interviewer_idx]["slots"] = slots
+        _save_persisted_slots()
         st.toast(f"Deleted: {format_slot_label(deleted)}")
         st.rerun()
 
@@ -913,6 +974,7 @@ def _render_interviewer_slots(interviewer_idx: int, interviewer_id: int) -> None
     if len(slots) > 1:
         if st.button("Clear All Slots", key=f"clear_all_{interviewer_id}", type="secondary"):
             st.session_state["panel_interviewers"][interviewer_idx]["slots"] = []
+            _save_persisted_slots()
             st.rerun()
 
 
@@ -1017,12 +1079,247 @@ def _render_edit_slot_form(interviewer_idx: int, interviewer_id: int) -> None:
                     }
                     st.session_state["panel_interviewers"][interviewer_idx]["slots"] = slots
                     st.session_state["editing_slot_index"] = None
+                    _save_persisted_slots()
                     st.success("Slot updated!")
                     st.rerun()
 
     with col_cancel:
         if st.button("Cancel", key=f"cancel_edit_{interviewer_id}"):
             st.session_state["editing_slot_index"] = None
+            st.rerun()
+
+    st.markdown("---")
+
+
+def _delete_parsed_slot(slot_idx: int) -> None:
+    """Remove a slot from session_state['slots'] and computed_intersections."""
+    slots = st.session_state.get("slots", [])
+    if 0 <= slot_idx < len(slots):
+        removed = slots.pop(slot_idx)
+        st.session_state["slots"] = slots
+        # Also remove from computed_intersections if present
+        intersections = st.session_state.get("computed_intersections", [])
+        key = (removed["date"], removed["start"], removed["end"])
+        st.session_state["computed_intersections"] = [
+            s for s in intersections if (s["date"], s["start"], s["end"]) != key
+        ]
+        # Reset editing index if it was pointing at or beyond removed slot
+        if st.session_state.get("editing_parsed_slot_index") is not None:
+            if st.session_state["editing_parsed_slot_index"] >= len(st.session_state["slots"]):
+                st.session_state["editing_parsed_slot_index"] = None
+        _save_persisted_slots()
+        st.toast(f"Deleted slot: {format_slot_label(removed)}")
+        st.rerun()
+
+
+def _render_parsed_slots_list(filtered_slots: List[Dict[str, str]]) -> None:
+    """Render editable list of parsed slots with Edit/Delete buttons."""
+    if not filtered_slots:
+        return
+
+    st.markdown("**Parsed Slots:**")
+
+    # Determine if multiple interviewers are involved
+    panel_interviewers = st.session_state.get("panel_interviewers", [])
+    interviewer_count = len([i for i in panel_interviewers if i.get("slots")])
+
+    # Interviewer filter for multi-interviewer scenarios
+    display_slots = filtered_slots
+    if interviewer_count > 1:
+        # Use actual panel interviewer names for the filter
+        interviewer_names = [
+            i.get("name") or i.get("email") or f"Interviewer {i['id']}"
+            for i in panel_interviewers if i.get("slots")
+        ]
+        if interviewer_names:
+            options = ["All Interviewers"] + interviewer_names
+            selected_interviewer = st.selectbox(
+                "View slots for",
+                options=options,
+                key="parsed_slots_interviewer_filter",
+            )
+            if selected_interviewer != "All Interviewers":
+                display_slots = [
+                    s for s in filtered_slots
+                    if selected_interviewer in s.get("available_names", [])
+                ]
+
+    all_slots = st.session_state.get("slots", [])
+
+    # Scrollable container for the slot list (max 300px height)
+    with st.container(height=300 if len(display_slots) > 5 else None):
+        for slot in display_slots:
+            # Find the absolute index in session_state["slots"]
+            slot_key = (slot["date"], slot["start"], slot["end"])
+            abs_idx = None
+            for j, s in enumerate(all_slots):
+                if (s["date"], s["start"], s["end"]) == slot_key:
+                    abs_idx = j
+                    break
+            if abs_idx is None:
+                continue
+
+            col_label, col_actions = st.columns([5, 2])
+            with col_label:
+                st.markdown(f"{format_slot_label(slot)}")
+            with col_actions:
+                btn_edit, btn_del = st.columns(2)
+                with btn_edit:
+                    if st.button("✏️", key=f"parsed_edit_{abs_idx}", help="Edit slot"):
+                        st.session_state["editing_parsed_slot_index"] = abs_idx
+                        st.session_state["adding_parsed_slot"] = False
+                        st.rerun()
+                with btn_del:
+                    if st.button("🗑️", key=f"parsed_del_{abs_idx}", help="Delete slot"):
+                        _delete_parsed_slot(abs_idx)
+
+    # Clear All button (outside scrollable container)
+    if len(filtered_slots) > 1:
+        if st.button("Clear All Slots", key="clear_all_parsed_slots"):
+            st.session_state["slots"] = []
+            st.session_state["computed_intersections"] = []
+            st.session_state["editing_parsed_slot_index"] = None
+            st.session_state["adding_parsed_slot"] = False
+            _save_persisted_slots()
+            st.toast("All slots cleared.")
+            st.rerun()
+
+
+def _render_parsed_slot_edit_form() -> None:
+    """Render inline edit form for the currently-editing parsed slot."""
+    edit_idx = st.session_state.get("editing_parsed_slot_index")
+    if edit_idx is None:
+        return
+
+    slots = st.session_state.get("slots", [])
+    if edit_idx >= len(slots):
+        st.session_state["editing_parsed_slot_index"] = None
+        return
+
+    slot = slots[edit_idx]
+
+    st.markdown("---")
+    st.markdown(f"**Editing:** {format_slot_label(slot)}")
+
+    col_date, col_start, col_end = st.columns(3)
+    with col_date:
+        new_date = st.date_input(
+            "Date",
+            value=datetime.strptime(slot["date"], "%Y-%m-%d").date(),
+            key="parsed_edit_date",
+        )
+    with col_start:
+        new_start = st.time_input(
+            "Start",
+            value=datetime.strptime(slot["start"], "%H:%M").time(),
+            key="parsed_edit_start",
+        )
+    with col_end:
+        new_end = st.time_input(
+            "End",
+            value=datetime.strptime(slot["end"], "%H:%M").time(),
+            key="parsed_edit_end",
+        )
+
+    col_save, col_cancel = st.columns(2)
+    with col_save:
+        if st.button("Save Changes", type="primary", key="parsed_edit_save"):
+            if new_end <= new_start:
+                st.error("End time must be after start time")
+            elif new_date < date.today():
+                st.error("Cannot set date in the past")
+            else:
+                duration = (datetime.combine(date.today(), new_end) - datetime.combine(date.today(), new_start)).seconds // 60
+                if duration < 30:
+                    st.error("Slot must be at least 30 minutes")
+                else:
+                    old_key = (slot["date"], slot["start"], slot["end"])
+                    updated_slot = {
+                        "date": new_date.strftime("%Y-%m-%d"),
+                        "start": new_start.strftime("%H:%M"),
+                        "end": new_end.strftime("%H:%M"),
+                        "source": slot.get("source", "parsed"),
+                    }
+                    # Preserve any extra metadata
+                    for k in slot:
+                        if k not in updated_slot:
+                            updated_slot[k] = slot[k]
+                    st.session_state["slots"][edit_idx] = updated_slot
+                    # Update in computed_intersections too
+                    intersections = st.session_state.get("computed_intersections", [])
+                    for idx, s in enumerate(intersections):
+                        if (s["date"], s["start"], s["end"]) == old_key:
+                            for k in updated_slot:
+                                intersections[idx][k] = updated_slot[k]
+                            break
+                    st.session_state["computed_intersections"] = intersections
+                    st.session_state["editing_parsed_slot_index"] = None
+                    _save_persisted_slots()
+                    st.success("Slot updated!")
+                    st.rerun()
+
+    with col_cancel:
+        if st.button("Cancel", key="parsed_edit_cancel"):
+            st.session_state["editing_parsed_slot_index"] = None
+            st.rerun()
+
+    st.markdown("---")
+
+
+def _render_add_parsed_slot_form() -> None:
+    """Render form to add a new parsed slot."""
+    if not st.session_state.get("adding_parsed_slot"):
+        if st.button("+ Add Slot", key="add_parsed_slot_btn"):
+            st.session_state["adding_parsed_slot"] = True
+            st.session_state["editing_parsed_slot_index"] = None
+            st.rerun()
+        return
+
+    st.markdown("---")
+    st.markdown("**Add New Slot:**")
+
+    col_date, col_start, col_end = st.columns(3)
+    with col_date:
+        new_date = st.date_input("Date", value=date.today(), key="add_parsed_date")
+    with col_start:
+        new_start = st.time_input("Start", value=datetime.strptime("09:00", "%H:%M").time(), key="add_parsed_start")
+    with col_end:
+        new_end = st.time_input("End", value=datetime.strptime("10:00", "%H:%M").time(), key="add_parsed_end")
+
+    col_save, col_cancel = st.columns(2)
+    with col_save:
+        if st.button("Add", type="primary", key="add_parsed_save"):
+            if new_end <= new_start:
+                st.error("End time must be after start time")
+            elif new_date < date.today():
+                st.error("Cannot set date in the past")
+            else:
+                duration = (datetime.combine(date.today(), new_end) - datetime.combine(date.today(), new_start)).seconds // 60
+                if duration < 30:
+                    st.error("Slot must be at least 30 minutes")
+                else:
+                    new_slot = {
+                        "date": new_date.strftime("%Y-%m-%d"),
+                        "start": new_start.strftime("%H:%M"),
+                        "end": new_end.strftime("%H:%M"),
+                        "source": "manual",
+                    }
+                    slot_key = (new_slot["date"], new_slot["start"], new_slot["end"])
+                    # Check for duplicates
+                    existing_keys = [(s["date"], s["start"], s["end"]) for s in st.session_state.get("slots", [])]
+                    if slot_key in existing_keys:
+                        st.error("This slot already exists.")
+                    else:
+                        st.session_state["slots"].append(new_slot)
+                        st.session_state["computed_intersections"].append(new_slot.copy())
+                        st.session_state["adding_parsed_slot"] = False
+                        _save_persisted_slots()
+                        st.toast(f"Added slot: {format_slot_label(new_slot)}")
+                        st.rerun()
+
+    with col_cancel:
+        if st.button("Cancel", key="add_parsed_cancel"):
+            st.session_state["adding_parsed_slot"] = False
             st.rerun()
 
     st.markdown("---")
@@ -2281,7 +2578,7 @@ def main() -> None:
                     cols = st.columns([3, 3, 1])
                     with cols[0]:
                         name = st.text_input(
-                            "Name",
+                            "Name *",
                             value=interviewer.get("name", ""),
                             key=f"interviewer_name_{interviewer['id']}",
                             placeholder="e.g., John Smith"
@@ -2289,7 +2586,7 @@ def main() -> None:
                         interviewers[idx]["name"] = name
                     with cols[1]:
                         email = st.text_input(
-                            "Email",
+                            "Email *",
                             value=interviewer.get("email", ""),
                             key=f"interviewer_email_{interviewer['id']}",
                             placeholder="john@company.com"
@@ -2299,10 +2596,11 @@ def main() -> None:
                         st.write("")  # Spacing
                         # Remove button (disabled if only 1 interviewer)
                         if len(interviewers) > 1:
-                            if st.button("Remove", key=f"remove_{interviewer['id']}"):
+                            if st.button("✕", key=f"remove_{interviewer['id']}", help="Remove interviewer"):
                                 st.session_state["panel_interviewers"] = [
                                     i for i in interviewers if i["id"] != interviewer["id"]
                                 ]
+                                _save_persisted_slots()
                                 st.rerun()
 
                     # File uploader
@@ -2325,6 +2623,19 @@ def main() -> None:
                         else:
                             st.caption(f"{slot_count} uploaded slot(s)")
 
+                    # Per-interviewer parse button
+                    if interviewer.get("file") or interviewer.get("slots"):
+                        if st.button(
+                            f"Parse {interviewer.get('name') or f'Interviewer {idx+1}'}",
+                            key=f"parse_single_{interviewer['id']}",
+                        ):
+                            if not interviewer.get("name", "").strip():
+                                st.error("Name is required before parsing.")
+                            elif not interviewer.get("email", "").strip():
+                                st.error("Email is required before parsing.")
+                            else:
+                                _parse_single_interviewer_availability(idx)
+
                     # Manual slot entry expander
                     with st.expander("Manual Slot Entry", expanded=False):
                         _render_manual_slot_form(idx, interviewer["id"])
@@ -2345,6 +2656,7 @@ def main() -> None:
                     "slots": [],
                     "timezone": st.session_state["selected_timezone"],
                 })
+                _save_persisted_slots()
                 st.rerun()
 
             st.markdown("---")
@@ -2376,10 +2688,19 @@ def main() -> None:
             except:
                 pass
 
-            parse_btn = st.button("Parse All Availability", type="primary")
+            parse_btn = st.button("Parse All Availability", type="secondary")
 
             if parse_btn:
-                _parse_all_panel_availability()
+                # Validate all interviewers have name and email
+                missing = []
+                for iv in st.session_state.get("panel_interviewers", []):
+                    if not iv.get("name", "").strip() or not iv.get("email", "").strip():
+                        label = iv.get("name", "").strip() or f"Interviewer {iv['id']}"
+                        missing.append(label)
+                if missing:
+                    st.error(f"Name and email are required for: {', '.join(missing)}")
+                else:
+                    _parse_all_panel_availability()
 
             st.markdown("#### Available Time Slots")
 
@@ -2433,6 +2754,13 @@ def main() -> None:
                     selected_slot = None
                 else:
                     st.info("Select a slot to create an invite, or generate a candidate email.")
+
+                    # Editable slots list
+                    st.markdown("---")
+                    _render_parsed_slots_list(filtered_slots)
+                    _render_parsed_slot_edit_form()
+                    _render_add_parsed_slot_form()
+                    st.markdown("---")
 
                     # Build slot labels with availability info
                     from slot_intersection import format_slot_label_with_availability
@@ -3598,6 +3926,72 @@ def _parse_availability_upload(upload) -> List[Dict[str, str]]:
     return list(uniq.values())
 
 
+def _parse_single_interviewer_availability(interviewer_idx: int) -> None:
+    """Parse availability for a single interviewer and recompute intersection."""
+    from slot_intersection import (
+        normalize_slots_to_utc,
+        merge_adjacent_slots,
+        compute_intersection,
+    )
+
+    interviewers = st.session_state.get("panel_interviewers", [])
+    if interviewer_idx >= len(interviewers):
+        st.error("Invalid interviewer index")
+        return
+
+    tz_name = st.session_state["selected_timezone"]
+    min_duration = st.session_state["duration_minutes"]
+    interviewer = interviewers[interviewer_idx]
+    interviewer_name = interviewer.get("name") or f"Interviewer {interviewer.get('id', '?')}"
+
+    # Parse this interviewer's file
+    existing_manual_slots = [s for s in interviewer.get("slots", []) if s.get("source") == "manual"]
+
+    try:
+        if interviewer.get("file"):
+            interviewer["file"].seek(0)
+            uploaded_slots = _parse_availability_upload(interviewer["file"])
+            for s in uploaded_slots:
+                s["source"] = "uploaded"
+            interviewer["slots"] = _merge_slots(existing_manual_slots, uploaded_slots)
+            uploaded_count = len(uploaded_slots)
+            st.success(f"Parsed {uploaded_count} slot(s) for {interviewer_name}.")
+        elif existing_manual_slots:
+            interviewer["slots"] = existing_manual_slots
+            st.info(f"No file uploaded for {interviewer_name}. Using {len(existing_manual_slots)} manual slot(s).")
+        else:
+            st.warning(f"No file or manual slots for {interviewer_name}.")
+            return
+    except Exception as e:
+        st.error(f"{interviewer_name}: {e}")
+        return
+
+    st.session_state["panel_interviewers"][interviewer_idx] = interviewer
+
+    # Recompute intersection across all interviewers
+    all_interviewer_slots: Dict[int, List] = {}
+    interviewer_names_map: Dict[int, str] = {}
+
+    for iv in interviewers:
+        if iv.get("slots"):
+            name = iv.get("name") or iv.get("email") or f"Interviewer {iv['id']}"
+            interviewer_names_map[iv["id"]] = name
+            normalized = normalize_slots_to_utc(iv["slots"], tz_name)
+            merged = merge_adjacent_slots(normalized)
+            all_interviewer_slots[iv["id"]] = merged
+
+    if all_interviewer_slots:
+        intersections = compute_intersection(
+            all_interviewer_slots,
+            min_duration_minutes=min_duration,
+            display_timezone=tz_name,
+            interviewer_names=interviewer_names_map,
+        )
+        st.session_state["computed_intersections"] = intersections
+        st.session_state["slots"] = intersections
+        _save_persisted_slots()
+
+
 def _parse_all_panel_availability() -> None:
     """Parse availability for all interviewers and compute intersection.
 
@@ -3671,6 +4065,7 @@ def _parse_all_panel_availability() -> None:
 
         # Also update legacy "slots" for backward compatibility
         st.session_state["slots"] = intersections
+        _save_persisted_slots()
 
         num_interviewers = len(all_interviewer_slots)
         total_slots = total_uploaded + total_manual
