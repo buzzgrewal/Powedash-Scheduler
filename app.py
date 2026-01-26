@@ -338,6 +338,52 @@ def _save_branding_settings(settings: Dict[str, Any]) -> None:
         st.warning(f"Could not save branding settings: {e}")
 
 
+def _get_email_templates_path() -> str:
+    """Get path for persistent email templates file."""
+    return get_secret("email_templates_path", "email_templates.json")
+
+
+def _load_email_templates() -> Dict[str, Any]:
+    """Load saved email templates from persistent storage."""
+    path = _get_email_templates_path()
+    try:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_email_template(name: str, template: Dict[str, Any]) -> bool:
+    """Save an email template to persistent storage."""
+    path = _get_email_templates_path()
+    try:
+        templates = _load_email_templates()
+        templates[name] = template
+        with open(path, 'w') as f:
+            json.dump(templates, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Could not save template: {e}")
+        return False
+
+
+def _delete_email_template(name: str) -> bool:
+    """Delete an email template from persistent storage."""
+    path = _get_email_templates_path()
+    try:
+        templates = _load_email_templates()
+        if name in templates:
+            del templates[name]
+            with open(path, 'w') as f:
+                json.dump(templates, f, indent=2)
+            return True
+    except Exception as e:
+        st.error(f"Could not delete template: {e}")
+    return False
+
+
 def get_graph_config() -> Optional[GraphConfig]:
     tenant_id = get_secret("graph_tenant_id")
     client_id = get_secret("graph_client_id")
@@ -362,11 +408,15 @@ def get_company_config() -> CompanyConfig:
     # Check session state for user customizations (if initialized)
     custom_name = st.session_state.get("custom_company_name") if hasattr(st, "session_state") else None
     custom_logo = st.session_state.get("custom_logo_data") if hasattr(st, "session_state") else None
+    email_logo = st.session_state.get("email_logo_url") if hasattr(st, "session_state") else None
     custom_color = st.session_state.get("custom_primary_color") if hasattr(st, "session_state") else None
+
+    # Priority: email_logo_url > custom_logo_data > secret
+    logo = email_logo or custom_logo or get_secret("company_logo_url")
 
     return CompanyConfig(
         name=custom_name or get_secret("company_name", "PowerDash HR"),
-        logo_url=custom_logo or get_secret("company_logo_url"),
+        logo_url=logo,
         primary_color=custom_color or get_secret("company_primary_color", "#0066CC"),
         website=get_secret("company_website"),
         sender_email=get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"),
@@ -503,26 +553,40 @@ def parse_slots_from_image(image: Image.Image, interviewer_timezone: Optional[st
         tz_instruction = f"\n\nThe calendar is in timezone: {interviewer_timezone}. Return times as shown (no conversion needed).\n"
 
     prompt = (
-        "You are extracting FREE time slots from a calendar screenshot.\n"
+        "You are extracting FREE/AVAILABLE time slots from an Outlook calendar screenshot.\n\n"
+        "CALENDAR LAYOUT:\n"
+        "  - This is a week view: days are shown as COLUMNS (Monday-Sunday left to right)\n"
+        "  - Hours are shown as ROWS on the LEFT EDGE (e.g., 07, 08, 09... or 7:00, 8:00, 9:00...)\n"
+        "  - The date range header shows which week is displayed (e.g., '19 January 2026 - 25 January 2026')\n"
+        "  - Each column has the day name AND date number at the top (e.g., 'MONDAY' with '19' below it)\n\n"
+        "HOW TO IDENTIFY FREE vs BUSY TIME:\n"
+        "  - BUSY TIME: Colored blocks (usually orange/peach) labeled 'Busy' - person is NOT available\n"
+        "  - FREE TIME: White/blank areas OR blocks explicitly labeled 'Free' - person IS available\n"
+        "  - FREE slots are the GAPS between busy blocks within business hours\n\n"
+        "EXTRACTION PROCESS:\n"
+        "  1. Read the date range from the header to get the correct year and dates\n"
+        "  2. For each weekday column (Mon-Fri), scan from top to bottom\n"
+        "  3. Identify all BUSY blocks by their position and the hour markers on the left\n"
+        "  4. FREE slots are the continuous white/blank regions BETWEEN busy blocks\n"
+        "  5. Use the hour markers on the left edge to determine precise start/end times\n"
+        "  6. If a block spans from the 09 line to the 10 line, it covers 09:00-10:00\n\n"
         "Return ONLY valid JSON (no markdown) as a list of objects with keys:\n"
-        "  - date (YYYY-MM-DD)\n"
+        "  - date (YYYY-MM-DD format - use the dates from the calendar header)\n"
         "  - start (HH:MM in 24-hour format)\n"
         "  - end (HH:MM in 24-hour format)\n"
-        "  - inferred_tz (timezone abbreviation if visible, e.g. 'PST', 'EST', 'GMT', or null if not visible)\n\n"
+        "  - inferred_tz (timezone abbreviation if visible, or null)\n\n"
         "IMPORTANT RULES:\n"
-        "  1. Only extract slots within business hours: 08:00 to 18:00 (in the output timezone). "
-        "Clamp any slot that extends outside this range (e.g., 07:00–10:00 becomes 08:00–10:00).\n"
-        "  2. Treat all-day events marked as 'unavailable', 'blocked', 'busy', 'out of office', or 'OOO' "
-        "as FULLY BUSY for the entire day. Do NOT extract any free slots on those days.\n"
-        "  3. Exclude weekends (Saturday and Sunday) entirely. Do NOT return any slots on weekend days.\n\n"
-        f"{tz_instruction}"
-        "Look for timezone indicators in:\n"
-        "  - Calendar headers or footers\n"
-        "  - Corner labels (e.g., 'Times shown in PST')\n"
-        "  - Time displays with timezone suffix (e.g., '2:00 PM EST')\n"
-        "  - UTC offset indicators (e.g., 'GMT-8')\n\n"
-        "Only include free slots that are at least 30 minutes.\n"
-        "If no slots found, return an empty list []."
+        "  1. Only extract FREE slots within business hours: 08:00 to 18:00.\n"
+        "  2. If a free gap starts before 08:00, use 08:00 as the start.\n"
+        "  3. If a free gap extends past 18:00, use 18:00 as the end.\n"
+        "  4. Exclude weekends (Saturday and Sunday) entirely.\n"
+        "  5. All-day 'Out of Office', 'OOO', 'Unavailable' = NO free slots that day.\n"
+        "  6. Only include free slots that are at least 30 minutes.\n"
+        f"{tz_instruction}\n"
+        "EXAMPLE: If Monday Jan 19 shows busy blocks at 14:00-15:00, then free slots are:\n"
+        "  - 08:00-14:00 (morning gap before first busy block)\n"
+        "  - 15:00-18:00 (afternoon gap after busy block ends)\n\n"
+        "If no free slots found, return an empty list []."
     )
 
     b64 = image_to_base64(image)
@@ -860,6 +924,7 @@ def ensure_session_state() -> None:
         # Branding customization (overrides secrets) - loaded from persistent storage
         "custom_company_name": None,  # Override company name from secrets
         "custom_logo_data": None,  # Base64 encoded logo data
+        "email_logo_url": None,  # Logo URL for email templates
         "custom_primary_color": None,  # Override primary brand color
         "custom_background_color": None,  # Override background color
         "_branding_loaded": False,  # Track if branding was loaded from file
@@ -1416,13 +1481,23 @@ Talent Acquisition
 
 
 def _build_logo_html(company: CompanyConfig) -> str:
-    """Build logo HTML section, or empty string if no logo URL configured."""
+    """Build logo HTML section, or empty string if no logo URL configured.
+
+    Supports both URLs and local file paths. Local files are converted to base64 data URLs.
+    Note: Some email clients may block base64 images; hosted URLs are more reliable.
+    """
     if not company.logo_url:
         return ""
+
+    # Convert local files to base64 data URL, or use URL as-is
+    logo_src = _get_logo_src(company.logo_url)
+    if not logo_src:
+        return ""
+
     return f'''
     <tr>
         <td align="center" style="padding: 20px 0 10px 0;">
-            <img src="{company.logo_url}" alt="{company.name}"
+            <img src="{logo_src}" alt="{company.name}"
                  style="max-height: 60px; max-width: 200px; height: auto; display: block;" />
         </td>
     </tr>
@@ -1455,14 +1530,14 @@ def build_branded_email_html(
     # Optional custom message
     custom_section = f'<p style="margin: 16px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">{custom_message}</p>' if custom_message else ""
 
-    # Build slot list HTML
+    # Build slot list HTML with numbered options
     slot_items = ""
-    for slot in slots:
+    for idx, slot in enumerate(slots, start=1):
         slot_items += f'''
         <tr>
             <td style="padding: 10px 12px; border-left: 3px solid {company.primary_color};
                        background-color: #f8f9fa; font-family: {_EMAIL_FONT_STACK}; font-size: 15px;">
-                {format_slot_label(slot)}
+                <strong style="color: {company.primary_color};">{idx}.</strong> {format_slot_label(slot)}
             </td>
         </tr>
         <tr><td style="height: 8px;"></td></tr>
@@ -1504,7 +1579,7 @@ def build_branded_email_html(
                                 {slot_items}
                             </table>
                             <p style="margin: 16px 0 0 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
-                                Simply reply to this email with your preferred time slot, and we will send you a calendar invitation with all the details.
+                                Simply reply to this email with the <strong>number</strong> of your preferred time slot (e.g., "1" or "2"), and we will send you a calendar invitation with all the details.
                             </p>
                         </td>
                     </tr>
@@ -1653,7 +1728,7 @@ def build_branded_email_plain(
 ) -> str:
     """Plain text version of branded email for fallback."""
     greeting = f"Dear {candidate_name}," if candidate_name else "Hello,"
-    slot_lines = "\n".join([f"  - {format_slot_label(s)}" for s in slots]) if slots else "  - (No slots available)"
+    slot_lines = "\n".join([f"  {idx}. {format_slot_label(s)}" for idx, s in enumerate(slots, start=1)]) if slots else "  (No slots available)"
 
     footer_parts = [company.signature_name]
     if company.website:
@@ -1667,7 +1742,7 @@ Please select one of the following available interview times:
 
 {slot_lines}
 
-Simply reply to this email with your preferred time slot, and we will send you a calendar invitation.
+Simply reply to this email with the NUMBER of your preferred time slot (e.g., "1" or "2"), and we will send you a calendar invitation.
 
 Best regards,
 {chr(10).join(footer_parts)}
@@ -2012,6 +2087,12 @@ def send_email_graph(
         attachment: Optional attachment dict with filename, data, maintype, subtype
         content_type: "Text" for plain text, "HTML" for HTML emails
     """
+    # Validate recipients before attempting to send
+    valid_recipients = [e for e in to_emails if e and e.strip()]
+    if not valid_recipients:
+        st.error("At least one recipient email is required to send an email.")
+        return False
+
     cfg = get_graph_config()
     if not cfg:
         st.warning("Graph is not configured. Add graph_tenant_id, graph_client_id, graph_client_secret, graph_scheduler_mailbox in Streamlit secrets.")
@@ -2029,8 +2110,8 @@ def send_email_graph(
         client.send_mail(
             subject=subject,
             body=body,
-            to_recipients=[e for e in to_emails if e],
-            cc_recipients=[e for e in (cc_emails or []) if e] or None,
+            to_recipients=valid_recipients,
+            cc_recipients=[e for e in (cc_emails or []) if e and e.strip()] or None,
             content_type=content_type,
             attachment=graph_attachment,
         )
@@ -2213,81 +2294,82 @@ def _build_ics(
 # Streamlit UI - Branding Components
 # ----------------------------
 
-def _apply_brand_theme(company: CompanyConfig, background_color: Optional[str] = None) -> None:
-    """Apply client's brand colors to UI elements via CSS."""
-    primary = company.primary_color
-    primary_light = _lighten_color(primary, 0.9)
-    primary_dark = _darken_color(primary, 0.2)
-
-    # Background color CSS (only if custom color is set)
-    bg_css = ""
-    if background_color:
-        bg_css = f"""
-/* Custom background color */
-.stApp, [data-testid="stAppViewContainer"] {{
-    background-color: {background_color} !important;
-}}
-.stMain, [data-testid="stMain"], .main .block-container {{
-    background-color: {background_color} !important;
-}}
-"""
-
-    css = f"""<style>
-{bg_css}
-/* Primary buttons */
-.stButton > button[kind="primary"], .stButton > button[data-testid="baseButton-primary"] {{
-    background-color: {primary} !important;
-    border-color: {primary} !important;
-}}
-.stButton > button[kind="primary"]:hover, .stButton > button[data-testid="baseButton-primary"]:hover {{
-    background-color: {primary_dark} !important;
-    border-color: {primary_dark} !important;
-}}
-/* All buttons hover effect */
-.stButton > button:hover {{
-    border-color: {primary} !important;
-}}
-/* Selected tabs */
-.stTabs [data-baseweb="tab-list"] button[aria-selected="true"] {{
-    border-bottom-color: {primary} !important;
-    color: {primary} !important;
-}}
-/* Tab highlight bar */
-.stTabs [data-baseweb="tab-highlight"] {{
-    background-color: {primary} !important;
-}}
-/* Links */
-a {{ color: {primary}; }}
-a:hover {{ color: {primary_dark}; }}
-/* Progress bars */
-.stProgress > div > div > div {{
-    background-color: {primary} !important;
-}}
-/* Selectbox/multiselect highlight */
-[data-baseweb="select"] [aria-selected="true"], [data-baseweb="menu"] [aria-selected="true"] {{
-    background-color: {primary_light} !important;
-}}
-/* Checkbox and radio when checked */
-.stCheckbox [data-testid="stCheckbox"] input:checked + div {{
-    background-color: {primary} !important;
-    border-color: {primary} !important;
-}}
-/* Slider */
-.stSlider [data-testid="stThumbValue"], .stSlider [data-baseweb="slider"] div[role="slider"] {{
-    background-color: {primary} !important;
-}}
-/* Sidebar accent */
-[data-testid="stSidebar"] {{
-    border-right: 3px solid {primary};
-}}
-/* Custom branded section class */
-.branded-section {{
-    border-left: 4px solid {primary};
-    padding-left: 16px;
-    margin: 16px 0;
-}}
-</style>"""
-    st.markdown(css, unsafe_allow_html=True)
+# NOTE: Sidebar customization and custom background colors disabled - using default Streamlit styling
+# def _apply_brand_theme(company: CompanyConfig, background_color: Optional[str] = None) -> None:
+#     """Apply client's brand colors to UI elements via CSS."""
+#     primary = company.primary_color
+#     primary_light = _lighten_color(primary, 0.9)
+#     primary_dark = _darken_color(primary, 0.2)
+#
+#     # Background color CSS (only if custom color is set)
+#     bg_css = ""
+#     if background_color:
+#         bg_css = f"""
+# /* Custom background color */
+# .stApp, [data-testid="stAppViewContainer"] {{
+#     background-color: {background_color} !important;
+# }}
+# .stMain, [data-testid="stMain"], .main .block-container {{
+#     background-color: {background_color} !important;
+# }}
+# """
+#
+#     css = f"""<style>
+# {bg_css}
+# /* Primary buttons */
+# .stButton > button[kind="primary"], .stButton > button[data-testid="baseButton-primary"] {{
+#     background-color: {primary} !important;
+#     border-color: {primary} !important;
+# }}
+# .stButton > button[kind="primary"]:hover, .stButton > button[data-testid="baseButton-primary"]:hover {{
+#     background-color: {primary_dark} !important;
+#     border-color: {primary_dark} !important;
+# }}
+# /* All buttons hover effect */
+# .stButton > button:hover {{
+#     border-color: {primary} !important;
+# }}
+# /* Selected tabs */
+# .stTabs [data-baseweb="tab-list"] button[aria-selected="true"] {{
+#     border-bottom-color: {primary} !important;
+#     color: {primary} !important;
+# }}
+# /* Tab highlight bar */
+# .stTabs [data-baseweb="tab-highlight"] {{
+#     background-color: {primary} !important;
+# }}
+# /* Links */
+# a {{ color: {primary}; }}
+# a:hover {{ color: {primary_dark}; }}
+# /* Progress bars */
+# .stProgress > div > div > div {{
+#     background-color: {primary} !important;
+# }}
+# /* Selectbox/multiselect highlight */
+# [data-baseweb="select"] [aria-selected="true"], [data-baseweb="menu"] [aria-selected="true"] {{
+#     background-color: {primary_light} !important;
+# }}
+# /* Checkbox and radio when checked */
+# .stCheckbox [data-testid="stCheckbox"] input:checked + div {{
+#     background-color: {primary} !important;
+#     border-color: {primary} !important;
+# }}
+# /* Slider */
+# .stSlider [data-testid="stThumbValue"], .stSlider [data-baseweb="slider"] div[role="slider"] {{
+#     background-color: {primary} !important;
+# }}
+# /* Sidebar accent */
+# [data-testid="stSidebar"] {{
+#     border-right: 3px solid {primary};
+# }}
+# /* Custom branded section class */
+# .branded-section {{
+#     border-left: 4px solid {primary};
+#     padding-left: 16px;
+#     margin: 16px 0;
+# }}
+# </style>"""
+#     st.markdown(css, unsafe_allow_html=True)
 
 
 def _render_header_full(company: CompanyConfig) -> None:
@@ -2396,157 +2478,157 @@ def _save_current_branding() -> None:
                 pass
 
 
-def _render_branding_sidebar() -> None:
-    """Render sidebar with branding customization settings."""
-    with st.sidebar:
-        st.markdown("### Settings")
-
-        # Company name customization
-        default_name = get_secret("company_name", "PowerDash HR")
-        current_name = st.session_state.get("custom_company_name") or default_name
-
-        new_name = st.text_input(
-            "Company Name",
-            value=current_name,
-            key="branding_name_input",
-            help="Customize the company name displayed in the header"
-        )
-
-        if new_name != current_name:
-            if new_name and new_name != default_name:
-                st.session_state["custom_company_name"] = new_name
-            elif new_name == default_name:
-                st.session_state["custom_company_name"] = None
-            _save_current_branding()
-            st.rerun()
-
-        st.markdown("---")
-
-        # Logo upload
-        st.markdown("**Company Logo**")
-
-        # Show current logo if set
-        current_logo = st.session_state.get("custom_logo_data")
-        if current_logo:
-            st.image(current_logo, width=150)
-            if st.button("Remove Logo", key="remove_logo_btn"):
-                st.session_state["custom_logo_data"] = None
-                _save_current_branding()
-                st.rerun()
-        else:
-            default_logo_path = get_secret("company_logo_url")
-            if default_logo_path:
-                logo_src = _get_logo_src(default_logo_path)
-                if logo_src:
-                    st.image(logo_src, width=150)
-                    st.caption("Default logo from settings")
-
-        uploaded_logo = st.file_uploader(
-            "Upload New Logo",
-            type=["png", "jpg", "jpeg", "gif", "svg"],
-            key="logo_uploader",
-            help="Upload a company logo (PNG, JPG, GIF, or SVG)"
-        )
-
-        if uploaded_logo is not None:
-            # Convert to base64 data URL
-            data = uploaded_logo.read()
-            ext = os.path.splitext(uploaded_logo.name)[1].lower()
-            mime_types = {
-                '.png': 'image/png',
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg',
-                '.gif': 'image/gif',
-                '.svg': 'image/svg+xml',
-            }
-            mime_type = mime_types.get(ext, 'image/png')
-            b64 = base64.b64encode(data).decode('utf-8')
-            data_url = f"data:{mime_type};base64,{b64}"
-
-            st.session_state["custom_logo_data"] = data_url
-            _save_current_branding()
-            st.rerun()
-
-        st.markdown("---")
-
-        # Brand color customization
-        st.markdown("**Brand Color**")
-
-        default_color = get_secret("company_primary_color", "#0066CC")
-        current_color = st.session_state.get("custom_primary_color") or default_color
-
-        # Show color preview with computed variants
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            new_color = st.color_picker(
-                "Primary",
-                value=current_color,
-                key="brand_color_picker",
-                help="Main brand color for buttons, links, and accents"
-            )
-        with col2:
-            light_color = _lighten_color(current_color, 0.9)
-            dark_color = _darken_color(current_color, 0.2)
-            st.markdown(f'<div style="display:flex;gap:4px;margin-top:26px;"><div style="width:24px;height:24px;background:{current_color};border-radius:4px;" title="Primary"></div><div style="width:24px;height:24px;background:{light_color};border-radius:4px;" title="Light"></div><div style="width:24px;height:24px;background:{dark_color};border-radius:4px;" title="Dark"></div></div>', unsafe_allow_html=True)
-            st.caption("Primary · Light · Dark")
-
-        if new_color != current_color:
-            if new_color != default_color:
-                st.session_state["custom_primary_color"] = new_color
-            else:
-                st.session_state["custom_primary_color"] = None
-            _save_current_branding()
-            st.rerun()
-
-        # Background color
-        st.markdown("**Background Color**")
-        current_bg = st.session_state.get("custom_background_color")
-
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            # Default to white if not set
-            new_bg = st.color_picker(
-                "Background",
-                value=current_bg or "#FFFFFF",
-                key="bg_color_picker",
-                help="Page background color"
-            )
-        with col2:
-            if current_bg:
-                st.markdown(f'<div style="margin-top:26px;padding:8px;background:{current_bg};border:1px solid #ddd;border-radius:4px;font-size:11px;color:#666;">Custom</div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<div style="margin-top:26px;padding:8px;background:#f0f0f0;border-radius:4px;font-size:11px;color:#888;">Default</div>', unsafe_allow_html=True)
-
-        # Only save if changed from current (and not white which is default)
-        if current_bg and new_bg != current_bg:
-            if new_bg.upper() == "#FFFFFF":
-                st.session_state["custom_background_color"] = None
-            else:
-                st.session_state["custom_background_color"] = new_bg
-            _save_current_branding()
-            st.rerun()
-        elif not current_bg and new_bg.upper() != "#FFFFFF":
-            st.session_state["custom_background_color"] = new_bg
-            _save_current_branding()
-            st.rerun()
-
-        st.markdown("---")
-
-        # Reset to defaults button
-        if st.button("Reset to Defaults", key="reset_branding_btn"):
-            st.session_state["custom_company_name"] = None
-            st.session_state["custom_logo_data"] = None
-            st.session_state["custom_primary_color"] = None
-            st.session_state["custom_background_color"] = None
-            _save_current_branding()
-            st.rerun()
-
-        # PowerDash branding at bottom
-        st.markdown("---")
-        powerdash_logo_src = _get_logo_src(get_secret("powerdash_logo_url", "logo.png"))
-        if powerdash_logo_src:
-            st.image(powerdash_logo_src, width=100)
-        st.caption("Powered by PowerDash HR")
+# def _render_branding_sidebar() -> None:
+#     """Render sidebar with branding customization settings."""
+#     with st.sidebar:
+#         st.markdown("### Settings")
+#
+#         # Company name customization
+#         default_name = get_secret("company_name", "PowerDash HR")
+#         current_name = st.session_state.get("custom_company_name") or default_name
+#
+#         new_name = st.text_input(
+#             "Company Name",
+#             value=current_name,
+#             key="branding_name_input",
+#             help="Customize the company name displayed in the header"
+#         )
+#
+#         if new_name != current_name:
+#             if new_name and new_name != default_name:
+#                 st.session_state["custom_company_name"] = new_name
+#             elif new_name == default_name:
+#                 st.session_state["custom_company_name"] = None
+#             _save_current_branding()
+#             st.rerun()
+#
+#         st.markdown("---")
+#
+#         # Logo upload
+#         st.markdown("**Company Logo**")
+#
+#         # Show current logo if set
+#         current_logo = st.session_state.get("custom_logo_data")
+#         if current_logo:
+#             st.image(current_logo, width=150)
+#             if st.button("Remove Logo", key="remove_logo_btn"):
+#                 st.session_state["custom_logo_data"] = None
+#                 _save_current_branding()
+#                 st.rerun()
+#         else:
+#             default_logo_path = get_secret("company_logo_url")
+#             if default_logo_path:
+#                 logo_src = _get_logo_src(default_logo_path)
+#                 if logo_src:
+#                     st.image(logo_src, width=150)
+#                     st.caption("Default logo from settings")
+#
+#         uploaded_logo = st.file_uploader(
+#             "Upload New Logo",
+#             type=["png", "jpg", "jpeg", "gif", "svg"],
+#             key="logo_uploader",
+#             help="Upload a company logo (PNG, JPG, GIF, or SVG)"
+#         )
+#
+#         if uploaded_logo is not None:
+#             # Convert to base64 data URL
+#             data = uploaded_logo.read()
+#             ext = os.path.splitext(uploaded_logo.name)[1].lower()
+#             mime_types = {
+#                 '.png': 'image/png',
+#                 '.jpg': 'image/jpeg',
+#                 '.jpeg': 'image/jpeg',
+#                 '.gif': 'image/gif',
+#                 '.svg': 'image/svg+xml',
+#             }
+#             mime_type = mime_types.get(ext, 'image/png')
+#             b64 = base64.b64encode(data).decode('utf-8')
+#             data_url = f"data:{mime_type};base64,{b64}"
+#
+#             st.session_state["custom_logo_data"] = data_url
+#             _save_current_branding()
+#             st.rerun()
+#
+#         st.markdown("---")
+#
+#         # Brand color customization
+#         st.markdown("**Brand Color**")
+#
+#         default_color = get_secret("company_primary_color", "#0066CC")
+#         current_color = st.session_state.get("custom_primary_color") or default_color
+#
+#         # Show color preview with computed variants
+#         col1, col2 = st.columns([1, 2])
+#         with col1:
+#             new_color = st.color_picker(
+#                 "Primary",
+#                 value=current_color,
+#                 key="brand_color_picker",
+#                 help="Main brand color for buttons, links, and accents"
+#             )
+#         with col2:
+#             light_color = _lighten_color(current_color, 0.9)
+#             dark_color = _darken_color(current_color, 0.2)
+#             st.markdown(f'<div style="display:flex;gap:4px;margin-top:26px;"><div style="width:24px;height:24px;background:{current_color};border-radius:4px;" title="Primary"></div><div style="width:24px;height:24px;background:{light_color};border-radius:4px;" title="Light"></div><div style="width:24px;height:24px;background:{dark_color};border-radius:4px;" title="Dark"></div></div>', unsafe_allow_html=True)
+#             st.caption("Primary · Light · Dark")
+#
+#         if new_color != current_color:
+#             if new_color != default_color:
+#                 st.session_state["custom_primary_color"] = new_color
+#             else:
+#                 st.session_state["custom_primary_color"] = None
+#             _save_current_branding()
+#             st.rerun()
+#
+#         # Background color
+#         st.markdown("**Background Color**")
+#         current_bg = st.session_state.get("custom_background_color")
+#
+#         col1, col2 = st.columns([1, 2])
+#         with col1:
+#             # Default to white if not set
+#             new_bg = st.color_picker(
+#                 "Background",
+#                 value=current_bg or "#FFFFFF",
+#                 key="bg_color_picker",
+#                 help="Page background color"
+#             )
+#         with col2:
+#             if current_bg:
+#                 st.markdown(f'<div style="margin-top:26px;padding:8px;background:{current_bg};border:1px solid #ddd;border-radius:4px;font-size:11px;color:#666;">Custom</div>', unsafe_allow_html=True)
+#             else:
+#                 st.markdown('<div style="margin-top:26px;padding:8px;background:#f0f0f0;border-radius:4px;font-size:11px;color:#888;">Default</div>', unsafe_allow_html=True)
+#
+#         # Only save if changed from current (and not white which is default)
+#         if current_bg and new_bg != current_bg:
+#             if new_bg.upper() == "#FFFFFF":
+#                 st.session_state["custom_background_color"] = None
+#             else:
+#                 st.session_state["custom_background_color"] = new_bg
+#             _save_current_branding()
+#             st.rerun()
+#         elif not current_bg and new_bg.upper() != "#FFFFFF":
+#             st.session_state["custom_background_color"] = new_bg
+#             _save_current_branding()
+#             st.rerun()
+#
+#         st.markdown("---")
+#
+#         # Reset to defaults button
+#         if st.button("Reset to Defaults", key="reset_branding_btn"):
+#             st.session_state["custom_company_name"] = None
+#             st.session_state["custom_logo_data"] = None
+#             st.session_state["custom_primary_color"] = None
+#             st.session_state["custom_background_color"] = None
+#             _save_current_branding()
+#             st.rerun()
+#
+#         # PowerDash branding at bottom
+#         st.markdown("---")
+#         powerdash_logo_src = _get_logo_src(get_secret("powerdash_logo_url", "logo.png"))
+#         if powerdash_logo_src:
+#             st.image(powerdash_logo_src, width=100)
+#         st.caption("Powered by PowerDash HR")
 
 
 # ----------------------------
@@ -2565,18 +2647,23 @@ def main() -> None:
 
     ensure_session_state()
 
-    # Apply brand theme CSS immediately so all UI elements use brand colors
-    company = get_company_config()
-    background_color = st.session_state.get("custom_background_color")
-    _apply_brand_theme(company, background_color)
+    # NOTE: Sidebar customization and custom background colors disabled - using default Streamlit styling
+    # # Apply brand theme CSS immediately so all UI elements use brand colors
+    # company = get_company_config()
+    # background_color = st.session_state.get("custom_background_color")
+    # _apply_brand_theme(company, background_color)
 
-    # Render branding settings sidebar
-    _render_branding_sidebar()
+    # # Render branding settings sidebar
+    # _render_branding_sidebar()
 
-    # Refresh company config in case sidebar changed it
+    # # Refresh company config in case sidebar changed it
+    # company = get_company_config()
+    # layout = get_layout_config()
+    # background_color = st.session_state.get("custom_background_color")
+
+    # Use default company config without sidebar customization
     company = get_company_config()
     layout = get_layout_config()
-    background_color = st.session_state.get("custom_background_color")
 
     audit = AuditLog(get_audit_log_path())
     _render_branded_header(company)
@@ -3035,6 +3122,80 @@ def main() -> None:
             include_recruiter = st.checkbox("Include recruiter as attendee", value=False, key="include_recruiter")
 
             st.markdown("----")
+            st.markdown("#### Email Branding")
+
+            # Logo URL input
+            current_logo = st.session_state.get("email_logo_url") or get_secret("company_logo_url", "")
+            logo_url = st.text_input(
+                "Logo URL (for email header)",
+                value=current_logo or "",
+                placeholder="https://example.com/logo.png",
+                key="email_logo_url_input",
+                help="Enter a publicly accessible URL to your company logo. Leave blank for no logo."
+            )
+            if logo_url != st.session_state.get("email_logo_url"):
+                st.session_state["email_logo_url"] = logo_url if logo_url else None
+
+            # Template management
+            st.markdown("##### Email Templates")
+            templates = _load_email_templates()
+            template_names = list(templates.keys())
+
+            col_load, col_save = st.columns(2)
+
+            with col_load:
+                if template_names:
+                    selected_template = st.selectbox(
+                        "Load template",
+                        options=[""] + template_names,
+                        key="template_select",
+                        format_func=lambda x: "Select a template..." if x == "" else x
+                    )
+                    if selected_template and st.button("Load", key="load_template_btn"):
+                        tpl = templates[selected_template]
+                        st.session_state["email_logo_url"] = tpl.get("logo_url")
+                        if tpl.get("company_name"):
+                            st.session_state["custom_company_name"] = tpl.get("company_name")
+                        if tpl.get("primary_color"):
+                            st.session_state["custom_primary_color"] = tpl.get("primary_color")
+                        st.success(f"Loaded template: {selected_template}")
+                        st.rerun()
+                else:
+                    st.caption("No saved templates yet")
+
+            with col_save:
+                new_template_name = st.text_input(
+                    "Save as template",
+                    placeholder="Template name",
+                    key="new_template_name"
+                )
+                if st.button("Save", key="save_template_btn"):
+                    if new_template_name:
+                        template_data = {
+                            "logo_url": st.session_state.get("email_logo_url"),
+                            "company_name": st.session_state.get("custom_company_name"),
+                            "primary_color": st.session_state.get("custom_primary_color"),
+                        }
+                        if _save_email_template(new_template_name, template_data):
+                            st.success(f"Template '{new_template_name}' saved!")
+                            st.rerun()
+                    else:
+                        st.warning("Enter a template name to save")
+
+            # Delete template option
+            if template_names:
+                with st.expander("Delete template"):
+                    del_template = st.selectbox(
+                        "Select template to delete",
+                        options=template_names,
+                        key="delete_template_select"
+                    )
+                    if st.button("Delete", key="delete_template_btn", type="secondary"):
+                        if _delete_email_template(del_template):
+                            st.success(f"Deleted template: {del_template}")
+                            st.rerun()
+
+            st.markdown("----")
             st.markdown("#### Actions")
 
             # Generate branded email to candidate
@@ -3075,28 +3236,32 @@ def main() -> None:
 
                 company = get_company_config()
                 if st.button("Send Email"):
-                    ok = send_email_graph(
-                        subject=f"Interview Opportunity at {company.name}: {role_title}",
-                        body=st.session_state["candidate_email_html"],
-                        to_emails=[candidate_email] if candidate_email else [],
-                        cc_emails=[recruiter_email] if recruiter_email else None,
-                        content_type="HTML",
-                    )
-                    audit.log(
-                        "graph_sent_scheduling_email" if ok else "graph_send_failed",
-                        actor=recruiter_email or "",
-                        candidate_email=candidate_email or "",
-                        hiring_manager_email=hiring_manager_email or "",
-                        recruiter_email=recruiter_email or "",
-                        role_title=role_title or "",
-                        payload={"subject": f"Interview Opportunity at {company.name}: {role_title}"},
-                        status="success" if ok else "failed",
-                        error_message="" if ok else "Graph email send failed",
-                    )
-                    if ok:
-                        st.success("Email sent.")
+                    # Validate recipient before attempting to send
+                    if not candidate_email:
+                        st.error("Candidate email is required. Please enter a valid email address above.")
                     else:
-                        st.error("Email send failed (see message above).")
+                        ok = send_email_graph(
+                            subject=f"Interview Opportunity at {company.name}: {role_title}",
+                            body=st.session_state["candidate_email_html"],
+                            to_emails=[candidate_email],
+                            cc_emails=[recruiter_email] if recruiter_email else None,
+                            content_type="HTML",
+                        )
+                        audit.log(
+                            "graph_sent_scheduling_email" if ok else "graph_send_failed",
+                            actor=recruiter_email or "",
+                            candidate_email=candidate_email or "",
+                            hiring_manager_email=hiring_manager_email or "",
+                            recruiter_email=recruiter_email or "",
+                            role_title=role_title or "",
+                            payload={"subject": f"Interview Opportunity at {company.name}: {role_title}"},
+                            status="success" if ok else "failed",
+                            error_message="" if ok else "Graph email send failed",
+                        )
+                        if ok:
+                            st.success("Email sent.")
+                        else:
+                            st.error("Email send failed (see message above).")
 
             # Create Graph event
             # Collect panel interviewers from session state
@@ -4349,7 +4514,11 @@ def _create_individual_invite(
 
     try:
         candidate_email = validate_email(candidate_email_raw, "Candidate email")
-        hm_email = validate_email(hm_email_raw, "Hiring manager email")
+        # Hiring manager email is only required if no panel interviewers
+        if panel_interviewers:
+            hm_email = validate_email_optional(hm_email_raw, "Hiring manager email")
+        else:
+            hm_email = validate_email(hm_email_raw, "Hiring manager email")
         rec_email = validate_email_optional(rec_email_raw, "Recruiter email")
     except ValidationError as e:
         return SchedulingResult(
@@ -4358,7 +4527,7 @@ def _create_individual_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=e.message
+            error=str(e)  # Include field name in error message
         )
 
     try:
@@ -4591,7 +4760,7 @@ def _create_group_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=e.message
+            error=str(e)  # Include field name in error message
         )
 
     try:
