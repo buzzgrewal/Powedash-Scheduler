@@ -801,6 +801,57 @@ def docx_extract_images(docx_bytes: bytes, max_images: int = 5) -> List[Image.Im
         return []
 
 
+def split_slot_by_duration(slot: Dict[str, str], duration_minutes: int) -> List[Dict[str, str]]:
+    """
+    Split a large availability window into discrete meeting slots.
+
+    Args:
+        slot: {"date": "2025-01-15", "start": "09:00", "end": "14:00", ...}
+        duration_minutes: Meeting duration (e.g., 60)
+
+    Returns:
+        List of slots, each exactly duration_minutes long.
+        Preserves all other slot metadata (inferred_tz, source, etc.)
+    """
+    from datetime import datetime, timedelta
+
+    # Guard against invalid duration
+    if duration_minutes <= 0:
+        return []
+
+    try:
+        start_dt = datetime.strptime(f"{slot['date']}T{slot['start']}", "%Y-%m-%dT%H:%M")
+        end_dt = datetime.strptime(f"{slot['date']}T{slot['end']}", "%Y-%m-%dT%H:%M")
+    except (ValueError, KeyError):
+        return []
+
+    # Get total available minutes
+    total_minutes = (end_dt - start_dt).total_seconds() / 60
+
+    # If window is smaller than duration, return empty
+    if total_minutes < duration_minutes:
+        return []
+
+    # If window exactly equals duration, return the slot as-is
+    if total_minutes == duration_minutes:
+        return [slot.copy()]
+
+    # Split into discrete slots
+    result = []
+    current_start = start_dt
+    duration_delta = timedelta(minutes=duration_minutes)
+
+    while current_start + duration_delta <= end_dt:
+        current_end = current_start + duration_delta
+        new_slot = slot.copy()
+        new_slot["start"] = current_start.strftime("%H:%M")
+        new_slot["end"] = current_end.strftime("%H:%M")
+        result.append(new_slot)
+        current_start = current_end
+
+    return result
+
+
 def parse_slots_from_text(text: str) -> List[Dict[str, str]]:
     """
     Use OpenAI to parse free/busy text into slots.
@@ -4261,10 +4312,19 @@ def _parse_all_panel_availability() -> None:
                     s["source"] = "uploaded"
                 total_uploaded += len(uploaded_slots)
                 # Merge manual + uploaded, preferring manual for duplicates
-                interviewer["slots"] = _merge_slots(existing_manual_slots, uploaded_slots)
+                merged_slots = _merge_slots(existing_manual_slots, uploaded_slots)
+
+                # Split continuous windows into discrete meeting-sized slots
+                split_slots = []
+                for s in merged_slots:
+                    split_slots.extend(split_slot_by_duration(s, min_duration))
+                interviewer["slots"] = split_slots if split_slots else merged_slots
             elif existing_manual_slots:
-                # No file but has manual slots - keep them
-                interviewer["slots"] = existing_manual_slots
+                # No file but has manual slots - split them too
+                split_slots = []
+                for s in existing_manual_slots:
+                    split_slots.extend(split_slot_by_duration(s, min_duration))
+                interviewer["slots"] = split_slots if split_slots else existing_manual_slots
 
             # Include interviewer if they have any slots
             if interviewer.get("slots"):
