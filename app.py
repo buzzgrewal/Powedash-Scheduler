@@ -32,6 +32,13 @@ from export_utils import (
     filter_audit_entries,
     AUDIT_ACTION_DESCRIPTIONS,
 )
+from calendar_parser import (
+    CalendarParser,
+    CalendarFormat,
+    ParserConfig,
+    ParseResult,
+    pdf_to_images_enhanced,
+)
 
 
 # ----------------------------
@@ -79,6 +86,26 @@ class SchedulingResult:
     event_id: Optional[str]
     teams_url: Optional[str]
     error: Optional[str]
+    warnings: Optional[List[str]] = None
+    recipients: Optional[List[str]] = None
+
+
+def _ensure_candidate_name(name: Optional[str], email: str) -> str:
+    """Derive display name from email if name is empty.
+
+    Examples:
+        - john.doe@example.com -> "John Doe"
+        - jane_smith@corp.com -> "Jane Smith"
+        - "" with email -> parsed name or "Candidate"
+    """
+    if name and name.strip():
+        return name.strip()
+    if email and "@" in email:
+        prefix = email.split("@")[0]
+        parts = prefix.replace(".", " ").replace("_", " ").replace("-", " ").split()
+        if parts and not prefix.isdigit():
+            return " ".join(word.capitalize() for word in parts)
+    return "Candidate"
 
 
 @dataclass
@@ -529,9 +556,13 @@ def image_to_base64(image: Image.Image) -> str:
 def parse_slots_from_image(image: Image.Image, interviewer_timezone: Optional[str] = None, display_timezone: Optional[str] = None) -> List[Dict[str, str]]:
     """
     Use OpenAI vision to parse free/busy calendar images into slots.
-    Expected JSON format:
+
+    This function uses CalendarParser with format detection and confidence scoring.
+    Debug info is stored in st.session_state["parser_debug_info"] when debug mode is enabled.
+
+    Expected return format:
     [
-      {"date": "2025-12-03", "start": "09:00", "end": "09:30"},
+      {"date": "2025-12-03", "start": "09:00", "end": "09:30", "confidence": 0.95},
       ...
     ]
     """
@@ -539,137 +570,47 @@ def parse_slots_from_image(image: Image.Image, interviewer_timezone: Optional[st
     if not client:
         return []
 
-    # Build timezone instruction
-    tz_instruction = ""
-    if interviewer_timezone and display_timezone and interviewer_timezone != display_timezone:
-        tz_instruction = (
-            f"\n\nTIMEZONE CONVERSION:\n"
-            f"  The calendar is in the interviewer's timezone: {interviewer_timezone}.\n"
-            f"  Convert all extracted times to the display timezone: {display_timezone}.\n"
-            f"  For example, if the calendar shows 09:00 in {interviewer_timezone} and the display timezone is {display_timezone}, "
-            f"convert accordingly. Return all times in {display_timezone}.\n"
-        )
-    elif interviewer_timezone:
-        tz_instruction = f"\n\nThe calendar is in timezone: {interviewer_timezone}. Return times as shown (no conversion needed).\n"
-
-    prompt = (
-        "You are extracting FREE/AVAILABLE time slots from an Outlook calendar screenshot.\n\n"
-        "CALENDAR LAYOUT:\n"
-        "  - This is a week view: days are shown as COLUMNS (Monday-Sunday left to right)\n"
-        "  - Hours are shown as ROWS on the LEFT EDGE (e.g., 07, 08, 09... or 7:00, 8:00, 9:00...)\n"
-        "  - The date range header shows which week is displayed (e.g., '19 January 2026 - 25 January 2026')\n"
-        "  - Each column has the day name AND date number at the top (e.g., 'MONDAY' with '19' below it)\n\n"
-        "HOW TO IDENTIFY FREE vs BUSY TIME:\n"
-        "  - BUSY TIME: Colored blocks (usually orange/peach) labeled 'Busy' - person is NOT available\n"
-        "  - FREE TIME: White/blank areas OR blocks explicitly labeled 'Free' - person IS available\n"
-        "  - FREE slots are the GAPS between busy blocks within business hours\n\n"
-        "EXTRACTION PROCESS:\n"
-        "  1. Read the date range from the header to get the correct year and dates\n"
-        "  2. For each weekday column (Mon-Fri), scan from top to bottom\n"
-        "  3. Identify all BUSY blocks by their position and the hour markers on the left\n"
-        "  4. FREE slots are the continuous white/blank regions BETWEEN busy blocks\n"
-        "  5. Use the hour markers on the left edge to determine precise start/end times\n"
-        "  6. If a block spans from the 09 line to the 10 line, it covers 09:00-10:00\n\n"
-        "Return ONLY valid JSON (no markdown) as a list of objects with keys:\n"
-        "  - date (YYYY-MM-DD format - use the dates from the calendar header)\n"
-        "  - start (HH:MM in 24-hour format)\n"
-        "  - end (HH:MM in 24-hour format)\n"
-        "  - inferred_tz (timezone abbreviation if visible, or null)\n\n"
-        "IMPORTANT RULES:\n"
-        "  1. Only extract FREE slots within business hours: 08:00 to 18:00.\n"
-        "  2. If a free gap starts before 08:00, use 08:00 as the start.\n"
-        "  3. If a free gap extends past 18:00, use 18:00 as the end.\n"
-        "  4. Exclude weekends (Saturday and Sunday) entirely.\n"
-        "  5. All-day 'Out of Office', 'OOO', 'Unavailable' = NO free slots that day.\n"
-        "  6. Only include free slots that are at least 30 minutes.\n"
-        f"{tz_instruction}\n"
-        "EXAMPLE: If Monday Jan 19 shows busy blocks at 14:00-15:00, then free slots are:\n"
-        "  - 08:00-14:00 (morning gap before first busy block)\n"
-        "  - 15:00-18:00 (afternoon gap after busy block ends)\n\n"
-        "If no free slots found, return an empty list []."
+    # Build parser config from secrets
+    debug_mode = get_secret("parser_debug_mode", "false").lower() == "true"
+    config = ParserConfig(
+        debug_mode=debug_mode,
+        pdf_dpi=int(get_secret("parser_pdf_dpi", "300")),
     )
 
-    b64 = image_to_base64(image)
+    # Create parser and set model
+    parser = CalendarParser(client, config)
+    parser.set_model(get_secret("openai_model", "gpt-5.2"))
 
     try:
-        resp = client.chat.completions.create(
-            model=get_secret("openai_model", "gpt-5.2"),
-            temperature=0,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that returns strict JSON."},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    ],
-                },
-            ],
+        # Parse with format detection
+        result = parser.parse_image(
+            image,
+            interviewer_timezone=interviewer_timezone,
+            display_timezone=display_timezone
         )
-        content = resp.choices[0].message.content.strip() if resp.choices else ""
-        # Strip code fences if present
-        if content.startswith("```"):
-            content = content.strip("`")
-            if "\n" in content:
-                content = content.split("\n", 1)[1].strip()
 
-        slots = json.loads(content) if content else []
-        valid_slots = []
-        for s in slots:
-            if isinstance(s, dict) and all(k in s for k in ("date", "start", "end")):
-                slot_date = str(s["date"])
-                slot_start = str(s["start"])
-                slot_end = str(s["end"])
+        # Store debug info in session state if enabled
+        if debug_mode:
+            debug_info = {
+                "detected_format": result.detected_format.value,
+                "format_confidence": result.format_confidence,
+                "preprocessing_applied": result.preprocessing_applied,
+                "raw_response": result.raw_response[:2000] if result.raw_response else None,
+                "slot_count": len(result.slots),
+            }
+            # Append to existing debug info list or create new
+            if "parser_debug_info" not in st.session_state:
+                st.session_state["parser_debug_info"] = []
+            st.session_state["parser_debug_info"].append(debug_info)
 
-                # Exclude weekends
-                try:
-                    dt = datetime.strptime(slot_date, "%Y-%m-%d")
-                    if dt.weekday() >= 5:  # Saturday=5, Sunday=6
-                        continue
-                except ValueError:
-                    continue
+        # Convert to legacy format (backward compatible)
+        return result.to_legacy_format()
 
-                # Clamp to business hours (08:00–18:00)
-                if slot_start < "08:00":
-                    slot_start = "08:00"
-                if slot_end > "18:00":
-                    slot_end = "18:00"
-
-                # Skip if slot is now invalid or too short (<30 min)
-                if slot_start >= slot_end:
-                    continue
-                try:
-                    start_dt = datetime.strptime(slot_start, "%H:%M")
-                    end_dt = datetime.strptime(slot_end, "%H:%M")
-                    if (end_dt - start_dt).seconds < 1800:  # 30 minutes
-                        continue
-                except ValueError:
-                    continue
-
-                slot_data = {
-                    "date": slot_date,
-                    "start": slot_start,
-                    "end": slot_end,
-                }
-                # Preserve inferred timezone if present
-                if s.get("inferred_tz"):
-                    slot_data["inferred_tz"] = str(s["inferred_tz"])
-                valid_slots.append(slot_data)
-        return valid_slots
-    except json.JSONDecodeError as e:
-        st.error(f"OpenAI returned invalid JSON: {e}")
-        log_structured(
-            LogLevel.ERROR,
-            f"OpenAI JSON parse error: {e}",
-            action="parse_slots_openai",
-            error_type="json_decode_error",
-        )
-        return []
     except Exception as e:
         st.error(f"Failed to parse availability via OpenAI: {e}")
         log_structured(
             LogLevel.ERROR,
-            f"OpenAI vision API error: {e}",
+            f"Calendar parser error: {e}",
             action="parse_slots_openai",
             error_type=type(e).__name__,
             exc_info=True,
@@ -678,7 +619,12 @@ def parse_slots_from_image(image: Image.Image, interviewer_timezone: Optional[st
 
 
 def pdf_to_images(pdf_bytes: bytes, max_pages: int = 3) -> List[Image.Image]:
-    """Convert PDF to images. Returns empty list on error instead of crashing."""
+    """Convert PDF to images. Returns empty list on error instead of crashing.
+
+    Uses configurable DPI (default 300) for better parsing accuracy.
+    Set parser_pdf_dpi secret to adjust.
+    """
+    dpi = int(get_secret("parser_pdf_dpi", "300"))
     images: List[Image.Image] = []
     doc = None
     try:
@@ -686,7 +632,7 @@ def pdf_to_images(pdf_bytes: bytes, max_pages: int = 3) -> List[Image.Image]:
         for i in range(min(len(doc), max_pages)):
             try:
                 page = doc.load_page(i)
-                pix = page.get_pixmap(dpi=200)
+                pix = page.get_pixmap(dpi=dpi)
                 img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
                 images.append(img)
             except Exception as e:
@@ -1018,7 +964,50 @@ def ensure_session_state() -> None:
 
 
 def format_slot_label(slot: Dict[str, str]) -> str:
-    return f"{slot['date']} {slot['start']}–{slot['end']}"
+    """Basic slot label for internal use, with confidence indicator if available."""
+    base_label = f"{slot['date']} {slot['start']}–{slot['end']}"
+
+    # Add confidence indicator if present
+    confidence = slot.get("confidence")
+    if confidence is not None:
+        try:
+            conf_pct = float(confidence) * 100
+            if conf_pct < 70:
+                # Low confidence - warning indicator
+                return f"⚠️ {base_label} ({conf_pct:.0f}%)"
+            elif conf_pct >= 90:
+                # High confidence - no indicator needed
+                return base_label
+            else:
+                # Medium confidence - subtle indicator
+                return f"{base_label} ({conf_pct:.0f}%)"
+        except (ValueError, TypeError):
+            pass
+
+    return base_label
+
+
+def format_slot_for_email(slot: Dict[str, str]) -> str:
+    """
+    Format slot in a professional, human-readable way for emails.
+    Example: "Monday, January 26, 2026 • 9:00 AM – 9:30 AM"
+    """
+    try:
+        date_obj = datetime.strptime(slot['date'], "%Y-%m-%d")
+        start_time = datetime.strptime(slot['start'], "%H:%M")
+        end_time = datetime.strptime(slot['end'], "%H:%M")
+
+        # Format: "Monday, January 26, 2026"
+        date_str = date_obj.strftime("%A, %B %d, %Y")
+
+        # Format time in 12-hour with AM/PM: "9:00 AM"
+        start_str = start_time.strftime("%I:%M %p").lstrip("0")
+        end_str = end_time.strftime("%I:%M %p").lstrip("0")
+
+        return f"{date_str} • {start_str} – {end_str}"
+    except (ValueError, KeyError):
+        # Fallback to basic format
+        return f"{slot.get('date', '')} {slot.get('start', '')}–{slot.get('end', '')}"
 
 
 def _merge_slots(manual_slots: List[Dict], uploaded_slots: List[Dict]) -> List[Dict]:
@@ -1490,6 +1479,53 @@ def _render_add_parsed_slot_form() -> None:
     st.markdown("---")
 
 
+def _render_parser_debug_panel() -> None:
+    """Render collapsible debug panel showing parser diagnostics."""
+    debug_mode = get_secret("parser_debug_mode", "false").lower() == "true"
+    if not debug_mode:
+        return
+
+    debug_info = st.session_state.get("parser_debug_info", [])
+    if not debug_info:
+        return
+
+    with st.expander("🔍 Parser Debug Info", expanded=False):
+        for i, info in enumerate(debug_info):
+            st.markdown(f"**Parse #{i + 1}:**")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                detected_format = info.get("detected_format", "unknown")
+                format_conf = info.get("format_confidence", 0) * 100
+                st.markdown(f"- **Format:** {detected_format}")
+                st.markdown(f"- **Format confidence:** {format_conf:.0f}%")
+
+            with col2:
+                preprocessing = info.get("preprocessing_applied", [])
+                slot_count = info.get("slot_count", 0)
+                st.markdown(f"- **Preprocessing:** {', '.join(preprocessing) if preprocessing else 'None'}")
+                st.markdown(f"- **Slots found:** {slot_count}")
+
+            # Show raw response (truncated) if available
+            raw_response = info.get("raw_response")
+            if raw_response:
+                st.text_area(
+                    f"Raw response (parse #{i + 1})",
+                    value=raw_response[:1500] + ("..." if len(raw_response) > 1500 else ""),
+                    height=100,
+                    key=f"debug_raw_response_{i}",
+                    disabled=True
+                )
+
+            if i < len(debug_info) - 1:
+                st.markdown("---")
+
+        # Clear debug info button
+        if st.button("Clear Debug Info", key="clear_parser_debug"):
+            st.session_state["parser_debug_info"] = []
+            st.rerun()
+
+
 def extract_common_timezone(slots: List[Dict[str, str]]) -> Optional[str]:
     """
     Extract the most common inferred timezone from parsed slots.
@@ -1572,29 +1608,52 @@ def build_branded_email_html(
     Uses inline CSS only for email client compatibility.
     Max width 600px, table-based layout.
     """
-    # Logo section
+    # Logo section or company name header
     logo_html = _build_logo_html(company)
+    if not logo_html:
+        # Show company name as header if no logo
+        logo_html = f'''
+        <tr>
+            <td align="center" style="padding: 30px 40px 20px 40px; background: linear-gradient(135deg, {company.primary_color} 0%, {company.primary_color}dd 100%);">
+                <h1 style="margin: 0; color: #ffffff; font-family: {_EMAIL_FONT_STACK}; font-size: 24px; font-weight: 600; letter-spacing: -0.5px;">
+                    {company.name}
+                </h1>
+            </td>
+        </tr>
+        '''
 
     # Greeting with candidate name
-    greeting = f"Dear {candidate_name}," if candidate_name else "Hello,"
+    greeting = f"Dear {candidate_name}," if candidate_name and candidate_name.strip() else "Hello,"
 
     # Optional custom message
     custom_section = f'<p style="margin: 16px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">{custom_message}</p>' if custom_message else ""
 
-    # Build slot list HTML with numbered options
+    # Build slot list HTML with numbered options - using better formatting
     slot_items = ""
     for idx, slot in enumerate(slots, start=1):
+        formatted_slot = format_slot_for_email(slot)
         slot_items += f'''
         <tr>
-            <td style="padding: 10px 12px; border-left: 3px solid {company.primary_color};
-                       background-color: #f8f9fa; font-family: {_EMAIL_FONT_STACK}; font-size: 15px;">
-                <strong style="color: {company.primary_color};">{idx}.</strong> {format_slot_label(slot)}
+            <td style="padding: 14px 16px; border-left: 4px solid {company.primary_color};
+                       background-color: #f8f9fa; border-radius: 0 4px 4px 0; font-family: {_EMAIL_FONT_STACK};">
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                    <tr>
+                        <td width="32" valign="top">
+                            <span style="display: inline-block; width: 26px; height: 26px; line-height: 26px; text-align: center;
+                                         background-color: {company.primary_color}; color: #ffffff; border-radius: 50%;
+                                         font-size: 13px; font-weight: 600;">{idx}</span>
+                        </td>
+                        <td style="padding-left: 12px; font-size: 15px; color: #333333;">
+                            {formatted_slot}
+                        </td>
+                    </tr>
+                </table>
             </td>
         </tr>
-        <tr><td style="height: 8px;"></td></tr>
+        <tr><td style="height: 10px;"></td></tr>
         '''
     if not slots:
-        slot_items = f'<tr><td style="padding: 10px 12px; color: #666; font-family: {_EMAIL_FONT_STACK};">(No slots available)</td></tr>'
+        slot_items = f'<tr><td style="padding: 14px 16px; color: #666; font-family: {_EMAIL_FONT_STACK}; background-color: #f8f9fa; border-radius: 4px;">(No slots available)</td></tr>'
 
     # Website link for footer
     website_link = ""
@@ -1612,32 +1671,34 @@ def build_branded_email_html(
         <tr>
             <td align="center" style="padding: 20px 10px;">
                 <table role="presentation" cellspacing="0" cellpadding="0" border="0"
-                       style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                       style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden;">
                     {logo_html}
                     <tr>
                         <td style="padding: 32px 40px;">
-                            <p style="margin: 0 0 16px 0; color: #333333; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
+                            <p style="margin: 0 0 20px 0; color: #333333; font-family: {_EMAIL_FONT_STACK}; font-size: 16px; line-height: 1.6;">
                                 {greeting}
                             </p>
-                            <p style="margin: 0 0 16px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
-                                Thank you for your interest in the <strong style="color: #333333;">{role_title}</strong> position at {company.name}.
+                            <p style="margin: 0 0 20px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.7;">
+                                Thank you for your interest in the <strong style="color: {company.primary_color};">{role_title}</strong> position at <strong>{company.name}</strong>. We were impressed with your background and would like to invite you for an interview.
                             </p>
                             {custom_section}
-                            <p style="margin: 0 0 8px 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
-                                Please select one of the following available interview times:
+                            <p style="margin: 0 0 16px 0; color: #333333; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; font-weight: 600;">
+                                Please select one of the following available times:
                             </p>
-                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 16px 0;">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin: 16px 0 24px 0;">
                                 {slot_items}
                             </table>
-                            <p style="margin: 16px 0 0 0; color: #555555; font-family: {_EMAIL_FONT_STACK}; font-size: 15px; line-height: 1.6;">
-                                Simply reply to this email with the <strong>number</strong> of your preferred time slot (e.g., "1" or "2"), and we will send you a calendar invitation with all the details.
-                            </p>
+                            <div style="background-color: #e8f4fd; border-radius: 6px; padding: 16px; margin-top: 20px;">
+                                <p style="margin: 0; color: #1a5a96; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; line-height: 1.6;">
+                                    <strong>How to respond:</strong> Simply reply to this email with the <strong>number</strong> of your preferred time slot (e.g., "1" or "2"), and we'll send you a calendar invitation with all the details.
+                                </p>
+                            </div>
                         </td>
                     </tr>
                     <!-- Signature -->
                     <tr>
-                        <td style="padding: 20px 40px; background-color: #f8f9fa; border-top: 1px solid #e9ecef; border-radius: 0 0 8px 8px;">
-                            <p style="margin: 0; color: #666666; font-family: {_EMAIL_FONT_STACK}; font-size: 14px;">
+                        <td style="padding: 24px 40px; background-color: #f8f9fa; border-top: 1px solid #e9ecef;">
+                            <p style="margin: 0; color: #666666; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; line-height: 1.6;">
                                 Best regards,<br/>
                                 <strong style="color: {company.primary_color};">{company.signature_name}</strong>
                             </p>
@@ -1778,8 +1839,8 @@ def build_branded_email_plain(
     company: CompanyConfig,
 ) -> str:
     """Plain text version of branded email for fallback."""
-    greeting = f"Dear {candidate_name}," if candidate_name else "Hello,"
-    slot_lines = "\n".join([f"  {idx}. {format_slot_label(s)}" for idx, s in enumerate(slots, start=1)]) if slots else "  (No slots available)"
+    greeting = f"Dear {candidate_name}," if candidate_name and candidate_name.strip() else "Hello,"
+    slot_lines = "\n".join([f"  {idx}. {format_slot_for_email(s)}" for idx, s in enumerate(slots, start=1)]) if slots else "  (No slots available)"
 
     footer_parts = [company.signature_name]
     if company.website:
@@ -1787,13 +1848,13 @@ def build_branded_email_plain(
 
     return f"""{greeting}
 
-Thank you for your interest in the {role_title} position at {company.name}.
+Thank you for your interest in the {role_title} position at {company.name}. We were impressed with your background and would like to invite you for an interview.
 
-Please select one of the following available interview times:
+Please select one of the following available times:
 
 {slot_lines}
 
-Simply reply to this email with the NUMBER of your preferred time slot (e.g., "1" or "2"), and we will send you a calendar invitation.
+HOW TO RESPOND: Simply reply to this email with the NUMBER of your preferred time slot (e.g., "1" or "2"), and we will send you a calendar invitation with all the details.
 
 Best regards,
 {chr(10).join(footer_parts)}
@@ -2061,33 +2122,99 @@ def send_email_smtp(
     to_emails: List[str],
     cc_emails: Optional[List[str]] = None,
     attachment: Optional[Dict[str, Any]] = None,
+    content_type: str = "Text",
+    plain_text_body: Optional[str] = None,
 ) -> bool:
+    """
+    Send email using SMTP (Gmail or other SMTP server).
+
+    Args:
+        content_type: "Text" for plain text, "HTML" for HTML emails
+        plain_text_body: Optional plain text fallback for HTML emails (multipart/alternative)
+    """
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
     cfg = _smtp_cfg()
     if not cfg:
-        st.warning("SMTP is not configured in secrets; email send is disabled.")
-        return False
+        return False  # SMTP not configured, caller can try alternative
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = cfg["from"]
-    msg["To"] = ", ".join([e for e in to_emails if e])
-    if cc_emails:
-        msg["Cc"] = ", ".join([e for e in cc_emails if e])
-    msg.set_content(body)
+    # For HTML emails, use multipart/alternative for better client compatibility
+    if content_type.upper() == "HTML":
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = cfg["from"]
+        msg["To"] = ", ".join([e for e in to_emails if e])
+        if cc_emails:
+            msg["Cc"] = ", ".join([e for e in cc_emails if e])
+        msg["MIME-Version"] = "1.0"
+
+        # Add plain text version first (fallback)
+        if plain_text_body:
+            plain_part = MIMEText(plain_text_body, "plain", "utf-8")
+        else:
+            # Generate basic plain text from HTML by stripping tags
+            import re
+            plain_fallback = re.sub(r'<[^>]+>', '', body)
+            plain_fallback = re.sub(r'\s+', ' ', plain_fallback).strip()
+            plain_part = MIMEText(plain_fallback, "plain", "utf-8")
+        msg.attach(plain_part)
+
+        # Add HTML version (preferred) - must come after plain text
+        html_part = MIMEText(body, "html", "utf-8")
+        msg.attach(html_part)
+    else:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = cfg["from"]
+        msg["To"] = ", ".join([e for e in to_emails if e])
+        if cc_emails:
+            msg["Cc"] = ", ".join([e for e in cc_emails if e])
+        msg.set_content(body)
 
     if attachment:
-        msg.add_attachment(
-            attachment["data"],
-            maintype=attachment.get("maintype", "application"),
-            subtype=attachment.get("subtype", "octet-stream"),
-            filename=attachment.get("filename", "attachment.bin"),
-        )
+        from email.mime.base import MIMEBase
+        from email import encoders
+
+        if isinstance(msg, MIMEMultipart):
+            # For MIMEMultipart, manually create and attach
+            att_part = MIMEBase(
+                attachment.get("maintype", "application"),
+                attachment.get("subtype", "octet-stream"),
+            )
+            att_part.set_payload(attachment["data"])
+            encoders.encode_base64(att_part)
+            att_part.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=attachment.get("filename", "attachment.bin"),
+            )
+            msg.attach(att_part)
+        else:
+            # For EmailMessage, use add_attachment
+            msg.add_attachment(
+                attachment["data"],
+                maintype=attachment.get("maintype", "application"),
+                subtype=attachment.get("subtype", "octet-stream"),
+                filename=attachment.get("filename", "attachment.bin"),
+            )
 
     try:
         with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
             server.starttls()
             server.login(cfg["username"], cfg["password"])
             server.send_message(msg)
+        # Log the email type for debugging
+        log_structured(
+            LogLevel.INFO,
+            f"Email sent successfully via SMTP",
+            action="smtp_send",
+            details={
+                "content_type": content_type,
+                "is_multipart": isinstance(msg, MIMEMultipart),
+                "mime_type": msg.get_content_type() if hasattr(msg, 'get_content_type') else "unknown",
+            },
+        )
         return True
     except smtplib.SMTPAuthenticationError as e:
         st.error(f"SMTP authentication failed: {e}")
@@ -2126,9 +2253,13 @@ def send_email_graph(
     cc_emails: Optional[List[str]] = None,
     attachment: Optional[Dict[str, Any]] = None,
     content_type: str = "Text",
+    plain_text_body: Optional[str] = None,
 ) -> bool:
     """
-    Send email using Microsoft Graph API.
+    Send email - tries SMTP (Gmail) first, falls back to Microsoft Graph API.
+
+    Args:
+        plain_text_body: For HTML emails, include plain text version for multipart/alternative
 
     Args:
         subject: Email subject line
@@ -2144,9 +2275,34 @@ def send_email_graph(
         st.error("At least one recipient email is required to send an email.")
         return False
 
+    # Try SMTP first (Gmail)
+    smtp_cfg = _smtp_cfg()
+    if smtp_cfg:
+        try:
+            result = send_email_smtp(
+                subject=subject,
+                body=body,
+                to_emails=valid_recipients,
+                cc_emails=cc_emails,
+                attachment=attachment,
+                content_type=content_type,
+                plain_text_body=plain_text_body,
+            )
+            if result:
+                format_info = "(HTML with multipart/alternative)" if content_type.upper() == "HTML" else "(plain text)"
+                st.success(f"Email sent via Gmail SMTP {format_info}")
+                return True
+        except Exception as e:
+            log_structured(
+                LogLevel.WARNING,
+                f"SMTP send failed, will try Graph API: {e}",
+                action="smtp_send_fallback",
+            )
+
+    # Fall back to Graph API
     cfg = get_graph_config()
     if not cfg:
-        st.warning("Graph is not configured. Add graph_tenant_id, graph_client_id, graph_client_secret, graph_scheduler_mailbox in Streamlit secrets.")
+        st.warning("Neither SMTP nor Graph API is configured for sending emails.")
         return False
 
     try:
@@ -2172,12 +2328,264 @@ def send_email_graph(
         return False
 
 
-def fetch_unread_emails_graph() -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+def fetch_emails_imap(include_read: bool = False, limit: int = 20) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
     """
-    Fetch unread emails from scheduler mailbox via Microsoft Graph API.
+    Fetch emails from scheduler mailbox via IMAP (Gmail).
+    Returns (emails, error_message, is_configured) tuple.
+    - error_message is None on success
+    - is_configured is False if IMAP credentials are missing
+    - include_read: if True, fetches all recent messages (not just unread)
+    """
+    import imaplib
+    import email as email_lib
+    from email.header import decode_header
+    import socket
+
+    imap_host = get_secret("imap_host", "")
+    imap_port = int(get_secret("imap_port", 993))
+    imap_username = get_secret("imap_username", "")
+    imap_password = get_secret("imap_password", "")
+
+    if not all([imap_host, imap_username, imap_password]):
+        return [], None, False  # IMAP not configured
+
+    mail = None
+    try:
+        # Set socket timeout to prevent hanging
+        socket.setdefaulttimeout(30)
+
+        # Connect to IMAP server
+        mail = imaplib.IMAP4_SSL(imap_host, imap_port)
+        mail.login(imap_username, imap_password)
+        mail.select("INBOX", readonly=True)  # readonly to not mark as read
+
+        # Search for emails
+        if include_read:
+            status, message_ids = mail.search(None, "ALL")
+        else:
+            status, message_ids = mail.search(None, "UNSEEN")
+
+        if status != "OK":
+            mail.logout()
+            return [], "Failed to search mailbox", True
+
+        # Get message IDs (most recent first)
+        id_list = message_ids[0].split()
+        if not id_list:
+            mail.logout()
+            return [], None, True  # No messages
+
+        id_list = id_list[-limit:]  # Limit to most recent
+        id_list.reverse()  # Most recent first
+
+        emails: List[Dict[str, Any]] = []
+        for msg_id in id_list:
+            try:
+                # Fetch message with flags in one request
+                status, msg_data = mail.fetch(msg_id, "(FLAGS BODY.PEEK[])")
+                if status != "OK" or not msg_data or not msg_data[0]:
+                    continue
+
+                # Parse flags
+                is_read = False
+                flags_part = msg_data[0][0] if isinstance(msg_data[0], tuple) else b""
+                if isinstance(flags_part, bytes):
+                    is_read = b"\\Seen" in flags_part
+
+                # Get raw email data
+                raw_email = None
+                for part in msg_data:
+                    if isinstance(part, tuple) and len(part) > 1:
+                        raw_email = part[1]
+                        break
+
+                if not raw_email:
+                    continue
+
+                # Parse email
+                msg = email_lib.message_from_bytes(raw_email)
+
+                # Decode subject
+                subject = ""
+                if msg["Subject"]:
+                    try:
+                        decoded_subject = decode_header(msg["Subject"])
+                        for part, encoding in decoded_subject:
+                            if isinstance(part, bytes):
+                                subject += part.decode(encoding or "utf-8", errors="ignore")
+                            else:
+                                subject += str(part)
+                    except:
+                        subject = str(msg["Subject"])
+
+                # Get from address
+                from_addr = ""
+                if msg["From"]:
+                    try:
+                        from_decoded = decode_header(msg["From"])
+                        for part, encoding in from_decoded:
+                            if isinstance(part, bytes):
+                                from_addr += part.decode(encoding or "utf-8", errors="ignore")
+                            else:
+                                from_addr += str(part)
+                        # Extract just the email address
+                        email_match = re.search(r'[\w\.-]+@[\w\.-]+', from_addr)
+                        if email_match:
+                            from_addr = email_match.group()
+                    except:
+                        from_addr = str(msg["From"])
+
+                # Get date
+                date_str = msg.get("Date", "")
+
+                # Get body (simplified - just get preview)
+                body_content = ""
+                try:
+                    if msg.is_multipart():
+                        # Collect both plain text and HTML versions, use the longest one
+                        plain_body = ""
+                        html_body = ""
+                        for part in msg.walk():
+                            content_type = part.get_content_type()
+                            if content_type == "text/plain":
+                                payload = part.get_payload(decode=True)
+                                if payload:
+                                    decoded = payload.decode("utf-8", errors="ignore")
+                                    if len(decoded) > len(plain_body):
+                                        plain_body = decoded
+                            elif content_type == "text/html":
+                                payload = part.get_payload(decode=True)
+                                if payload:
+                                    html_content = payload.decode("utf-8", errors="ignore")
+                                    # Strip HTML tags to get text content
+                                    text_from_html = re.sub(r'<[^>]+>', ' ', html_content)
+                                    # Clean up whitespace
+                                    text_from_html = re.sub(r'\s+', ' ', text_from_html).strip()
+                                    if len(text_from_html) > len(html_body):
+                                        html_body = text_from_html
+                        # Use the longer of the two (HTML often has complete content)
+                        body_content = plain_body if len(plain_body) >= len(html_body) else html_body
+                    else:
+                        payload = msg.get_payload(decode=True)
+                        if payload:
+                            body_content = payload.decode("utf-8", errors="ignore")
+                        else:
+                            body_content = str(msg.get_payload())
+                except:
+                    body_content = "(Could not decode body)"
+
+                # Store full body for slot detection, truncate for preview
+                full_body = body_content.strip()
+                preview_body = full_body
+                if len(preview_body) > 500:
+                    preview_body = preview_body[:500] + "..."
+
+                emails.append({
+                    "id": msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id),
+                    "from": from_addr,
+                    "subject": subject,
+                    "date": date_str,
+                    "body": preview_body,  # Truncated for display
+                    "full_body": full_body,  # Full body for slot detection
+                    "is_read": is_read,
+                })
+            except Exception as e:
+                # Skip problematic messages
+                continue
+
+        mail.logout()
+        return emails, None, True
+
+    except imaplib.IMAP4.error as e:
+        if mail:
+            try:
+                mail.logout()
+            except:
+                pass
+        log_structured(
+            LogLevel.ERROR,
+            f"IMAP error: {e}",
+            action="imap_fetch_messages",
+            error_type="imap_error",
+        )
+        return [], f"IMAP error: {e}", True
+    except socket.timeout:
+        if mail:
+            try:
+                mail.logout()
+            except:
+                pass
+        return [], "IMAP connection timed out", True
+    except Exception as e:
+        if mail:
+            try:
+                mail.logout()
+            except:
+                pass
+        log_structured(
+            LogLevel.ERROR,
+            f"Failed to fetch emails via IMAP: {e}",
+            action="imap_fetch_messages",
+            error_type="imap_error",
+            exc_info=True,
+        )
+        return [], f"Failed to fetch emails: {e}", True
+    finally:
+        # Reset socket timeout
+        socket.setdefaulttimeout(None)
+
+
+def mark_email_read_imap(msg_id: str) -> bool:
+    """
+    Mark an email as read via IMAP.
+    Returns True if successful, False otherwise.
+    """
+    import imaplib
+    import socket
+
+    imap_host = get_secret("imap_host", "")
+    imap_port = int(get_secret("imap_port", 993))
+    imap_username = get_secret("imap_username", "")
+    imap_password = get_secret("imap_password", "")
+
+    if not all([imap_host, imap_username, imap_password]):
+        return False
+
+    mail = None
+    try:
+        socket.setdefaulttimeout(10)
+        mail = imaplib.IMAP4_SSL(imap_host, imap_port)
+        mail.login(imap_username, imap_password)
+        mail.select("INBOX")  # Not readonly - we need to modify flags
+
+        # Mark as read by adding \Seen flag
+        status, _ = mail.store(msg_id, '+FLAGS', '\\Seen')
+        mail.logout()
+        return status == "OK"
+    except Exception as e:
+        log_structured(
+            LogLevel.WARNING,
+            f"Failed to mark email as read: {e}",
+            action="mark_email_read",
+            error_type="imap_error",
+        )
+        if mail:
+            try:
+                mail.logout()
+            except:
+                pass
+        return False
+    finally:
+        socket.setdefaulttimeout(None)
+
+
+def fetch_unread_emails_graph(include_read: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+    """
+    Fetch emails from scheduler mailbox via Microsoft Graph API.
     Returns (emails, error_message, is_configured) tuple.
     - error_message is None on success
     - is_configured is False if Graph credentials are missing
+    - include_read: if True, fetches all recent messages (not just unread)
 
     Uses the same Graph credentials as calendar operations.
     """
@@ -2188,7 +2596,7 @@ def fetch_unread_emails_graph() -> Tuple[List[Dict[str, Any]], Optional[str], bo
     try:
         from graph_client import GraphClient
         client = GraphClient(cfg)
-        messages = client.fetch_unread_messages(top=50)
+        messages = client.fetch_unread_messages(top=50, include_read=include_read)
 
         emails: List[Dict[str, Any]] = []
         for msg in messages:
@@ -2209,12 +2617,20 @@ def fetch_unread_emails_graph() -> Tuple[List[Dict[str, Any]], Optional[str], bo
                     body_content = re.sub(r'<[^>]+>', '', body_content)
                     body_content = body_content.strip()
 
+            # Store full body for slot detection, truncate for preview display
+            full_body = body_content
+            preview_body = body_content
+            if len(preview_body) > 500:
+                preview_body = preview_body[:500] + "..."
+
             emails.append({
                 "id": msg.get("id", ""),
                 "from": from_addr,
                 "subject": msg.get("subject", ""),
                 "date": msg.get("receivedDateTime", ""),
-                "body": body_content,
+                "body": preview_body,  # Truncated for display
+                "full_body": full_body,  # Full body for slot detection
+                "is_read": msg.get("isRead", False),
             })
 
         return emails, None, True  # Success, configured
@@ -2247,26 +2663,116 @@ def fetch_unread_emails_graph() -> Tuple[List[Dict[str, Any]], Optional[str], bo
         return [], f"Failed to fetch emails: {e}", True
 
 
+def _extract_slots_from_email_body(text: str) -> List[Dict[str, str]]:
+    """
+    Extract numbered slots from the email body.
+    Parses patterns like:
+      *1.* 2026-01-26 00:00–00:30
+      1. 2026-01-26 00:00-00:30
+      1) 2026-01-26 00:00 - 00:30
+    Returns list of slot dicts with date, start, end keys.
+    """
+    slots = []
+    # Pattern to match numbered slots with various formats
+    # Handles: *1.* date time–time, 1. date time-time, 1) date time - time
+    slot_pattern = re.compile(
+        r'(?:\*?(\d{1,3})[\.\)]\*?\s*)'  # Slot number like *1.* or 1. or 1)
+        r'(\d{4}-\d{2}-\d{2})\s+'  # Date like 2026-01-26
+        r'(\d{1,2}:\d{2})\s*'  # Start time like 00:00
+        r'[–\-—]\s*'  # Dash separator (various unicode dashes)
+        r'(\d{1,2}:\d{2})',  # End time like 00:30
+        re.MULTILINE
+    )
+
+    for match in slot_pattern.finditer(text):
+        slot_num = int(match.group(1))
+        date = match.group(2)
+        start = match.group(3).zfill(5)  # Ensure HH:MM format
+        end = match.group(4).zfill(5)
+
+        # Insert at correct position (slot numbers are 1-indexed)
+        while len(slots) < slot_num:
+            slots.append(None)  # Placeholder
+        slots[slot_num - 1] = {"date": date, "start": start, "end": end}
+
+    # Remove any None placeholders
+    slots = [s for s in slots if s is not None]
+    return slots
+
+
 def detect_slot_choice_from_text(text: str, slots: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
     """
-    Heuristic: find a slot label or date+time mention in a reply.
+    Detect which slot the candidate chose from their reply.
+
+    Handles:
+    1. Simple slot numbers: "3", "70", "slot 3", "#3", "option 3"
+    2. Full slot labels: "2026-01-26 01:00-01:30"
+    3. Date + time mentions
+
+    If the email body contains numbered slots (from the quoted original email),
+    those are extracted and used instead of the session state slots.
     """
-    t = (text or "").lower()
-    for s in slots:
+    t = (text or "").strip()
+
+    # Try to extract slots from the email body (quoted original email)
+    # This is more reliable than session state which may have changed
+    email_slots = _extract_slots_from_email_body(t)
+
+    # Use email slots if we found them and they have more slots than session state
+    effective_slots = email_slots if len(email_slots) > len(slots or []) else (slots or [])
+
+    if not effective_slots:
+        return None
+
+    # Method 1: Look for slot number at the START of the reply (before quoted text)
+    # Email replies typically have the response at the top, then "On ... wrote:" and quoted text
+    # Extract just the reply part (before "On " or ">")
+    reply_text = t
+
+    # Split on common reply markers
+    for marker in ["\nOn ", "\n>", "\r\n>", "On Mon,", "On Tue,", "On Wed,", "On Thu,", "On Fri,", "On Sat,", "On Sun,"]:
+        if marker in reply_text:
+            reply_text = reply_text.split(marker)[0]
+            break
+
+    reply_text = reply_text.strip()
+
+    # Look for slot number (1-3 digits to support up to 999 slots)
+    slot_num_patterns = [
+        r"^\s*(\d{1,3})\s*$",  # Just a number like "3" or "70" or "252"
+        r"^\s*(\d{1,3})\s*[\n\r.,!]",  # Number at start followed by newline or punctuation
+        r"^\s*(\d{1,3})\b",  # Number at the very start
+        r"(?:slot|option|choice|number|#)\s*(\d{1,3})\b",  # "slot 70", "#70", etc.
+        r"\b(\d{1,3})\s*(?:st|nd|rd|th)?\s*(?:slot|option|choice)",  # "70th slot"
+    ]
+
+    for pattern in slot_num_patterns:
+        match = re.search(pattern, reply_text, re.IGNORECASE)
+        if match:
+            try:
+                slot_num = int(match.group(1))
+                if 1 <= slot_num <= len(effective_slots):
+                    return effective_slots[slot_num - 1]  # Convert to 0-indexed
+            except (ValueError, IndexError):
+                pass
+
+    # Method 2: Look for full slot label in text
+    t_lower = t.lower()
+    for s in effective_slots:
         label = format_slot_label(s).lower()
-        if label in t:
+        if label in t_lower:
             return s
 
-    # fallback: look for YYYY-MM-DD and HH:MM
-    m_date = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", t)
-    m_time = re.search(r"\b(\d{1,2}:\d{2})\b", t)
+    # Method 3: Look for date and time that match a slot
+    # Only match if the date+time actually corresponds to one of our slots
+    m_date = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", reply_text)
+    m_time = re.search(r"\b(\d{1,2}:\d{2})\b", reply_text)
     if m_date and m_time:
         date = m_date.group(1)
         start = m_time.group(1).zfill(5)
-        for s in slots:
-            if s["date"] == date and s["start"] == start:
+        for s in effective_slots:
+            if s.get("date") == date and s.get("start") == start:
                 return s
-        return {"date": date, "start": start, "end": ""}
 
     return None
 
@@ -2281,6 +2787,112 @@ def _make_graph_client() -> Optional[GraphClient]:
     return GraphClient(cfg)
 
 
+def _build_professional_invite_body(
+    *,
+    time_display: str,
+    role_title: str,
+    duration_minutes: int,
+    panel_members: Optional[List[Dict[str, str]]] = None,
+    agenda: Optional[str] = None,
+    candidates: Optional[List[str]] = None,  # For group invites
+) -> str:
+    """Build a professional HTML body for calendar invites."""
+    company = get_company_config()
+
+    # Panel section
+    panel_section = ""
+    if panel_members:
+        panel_names = [p.get("name") or p.get("email", "") for p in panel_members]
+        panel_list = "".join([f'<li style="padding: 4px 0; color: #333333;">{name}</li>' for name in panel_names])
+        panel_section = f'''
+        <div style="margin: 16px 0; padding: 12px 16px; background-color: #f8f9fa; border-radius: 6px; border-left: 3px solid {company.primary_color};">
+            <p style="margin: 0 0 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; font-weight: 600; color: #333333;">
+                Interview Panel
+            </p>
+            <ul style="margin: 0; padding-left: 20px; font-family: {_EMAIL_FONT_STACK}; font-size: 14px;">
+                {panel_list}
+            </ul>
+        </div>
+        '''
+
+    # Candidates section (for group interviews)
+    candidates_section = ""
+    if candidates:
+        cand_list = "".join([f'<li style="padding: 4px 0; color: #333333;">{c}</li>' for c in candidates])
+        candidates_section = f'''
+        <div style="margin: 16px 0; padding: 12px 16px; background-color: #fff8e6; border-radius: 6px; border-left: 3px solid #ffc107;">
+            <p style="margin: 0 0 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; font-weight: 600; color: #333333;">
+                Candidates ({len(candidates)})
+            </p>
+            <ul style="margin: 0; padding-left: 20px; font-family: {_EMAIL_FONT_STACK}; font-size: 14px;">
+                {cand_list}
+            </ul>
+        </div>
+        '''
+
+    # Agenda section
+    agenda_section = ""
+    if agenda and agenda.strip():
+        agenda_html = agenda.strip().replace(chr(10), '<br>')
+        agenda_section = f'''
+        <div style="margin: 16px 0;">
+            <p style="margin: 0 0 8px 0; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; font-weight: 600; color: #333333;">
+                Agenda
+            </p>
+            <p style="margin: 0; font-family: {_EMAIL_FONT_STACK}; font-size: 14px; color: #555555; line-height: 1.5;">
+                {agenda_html}
+            </p>
+        </div>
+        '''
+
+    return f'''
+    <div style="font-family: {_EMAIL_FONT_STACK}; max-width: 600px;">
+        <div style="margin-bottom: 20px; padding: 16px; background-color: #e8f4fd; border-radius: 8px; border: 1px solid #b8daff;">
+            <p style="margin: 0; font-size: 16px; font-weight: 600; color: {company.primary_color};">
+                Interview Details
+            </p>
+        </div>
+
+        <table style="width: 100%; border-collapse: collapse; margin-bottom: 16px;">
+            <tr>
+                <td style="padding: 8px 0; font-size: 14px; color: #666666; width: 120px; vertical-align: top;">
+                    <strong>Date & Time:</strong>
+                </td>
+                <td style="padding: 8px 0; font-size: 14px; color: #333333;">
+                    {time_display}
+                </td>
+            </tr>
+            <tr>
+                <td style="padding: 8px 0; font-size: 14px; color: #666666; vertical-align: top;">
+                    <strong>Position:</strong>
+                </td>
+                <td style="padding: 8px 0; font-size: 14px; color: #333333;">
+                    {role_title or "Interview"}
+                </td>
+            </tr>
+            <tr>
+                <td style="padding: 8px 0; font-size: 14px; color: #666666; vertical-align: top;">
+                    <strong>Duration:</strong>
+                </td>
+                <td style="padding: 8px 0; font-size: 14px; color: #333333;">
+                    {duration_minutes} minutes
+                </td>
+            </tr>
+        </table>
+
+        {candidates_section}
+        {panel_section}
+        {agenda_section}
+
+        <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #e9ecef;">
+            <p style="margin: 0; font-size: 13px; color: #888888;">
+                Please ensure you join on time. If you need to reschedule, please contact us as soon as possible.
+            </p>
+        </div>
+    </div>
+    '''
+
+
 def _graph_event_payload(
     *,
     subject: str,
@@ -2291,13 +2903,28 @@ def _graph_event_payload(
     attendees: List[Tuple[str, str]],
     is_teams: bool,
     location: str,
+    cc_attendees: Optional[List[Tuple[str, str]]] = None,
 ) -> Dict[str, Any]:
+    """
+    Build Graph API event payload.
+
+    Args:
+        attendees: List of (email, name) tuples for required attendees (To:)
+        cc_attendees: List of (email, name) tuples for optional attendees (CC:)
+    """
+    # Build attendees list with required attendees
+    all_attendees = [{"emailAddress": {"address": e, "name": n or e}, "type": "required"} for (e, n) in attendees]
+
+    # Add CC attendees as optional
+    if cc_attendees:
+        all_attendees.extend([{"emailAddress": {"address": e, "name": n or e}, "type": "optional"} for (e, n) in cc_attendees])
+
     payload: Dict[str, Any] = {
         "subject": subject,
         "body": {"contentType": "HTML", "content": body_html},
         "start": {"dateTime": start_local.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": time_zone},
         "end": {"dateTime": end_local.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": time_zone},
-        "attendees": [{"emailAddress": {"address": e, "name": n or e}, "type": "required"} for (e, n) in attendees],
+        "attendees": all_attendees,
     }
 
     if is_teams:
@@ -2963,6 +3590,7 @@ def main() -> None:
                     _render_parsed_slots_list(filtered_slots)
                     _render_parsed_slot_edit_form()
                     _render_add_parsed_slot_form()
+                    _render_parser_debug_panel()
                     st.markdown("---")
 
                     # Build slot labels with availability info
@@ -3249,25 +3877,142 @@ def main() -> None:
             st.markdown("----")
             st.markdown("#### Actions")
 
+            # Interviewer selection for email
+            panel_interviewers = st.session_state.get("panel_interviewers", [])
+            interviewers_with_slots = [i for i in panel_interviewers if i.get("slots")]
+
+            selected_interviewers = []  # List of selected interviewer dicts
+
+            if len(interviewers_with_slots) > 1:
+                st.markdown("**Select Interviewer(s) for Interview:**")
+                interviewer_options = [
+                    {
+                        "id": i["id"],
+                        "name": i.get("name") or i.get("email") or f"Interviewer {i['id']}",
+                        "email": i.get("email", ""),
+                        "slots": i.get("slots", []),
+                    }
+                    for i in interviewers_with_slots
+                ]
+
+                # Multi-select for interviewers
+                option_names = [f"{opt['name']} ({len(opt['slots'])} slots)" for opt in interviewer_options]
+                selected_names = st.multiselect(
+                    "Select interviewer(s) to include",
+                    options=option_names,
+                    default=[option_names[0]] if option_names else [],
+                    key="email_interviewer_multiselect",
+                    help="Select one or more interviewers. Email will show slots where ALL selected interviewers are available."
+                )
+
+                # Map selected names back to interviewer data
+                for name in selected_names:
+                    idx = option_names.index(name)
+                    selected_interviewers.append(interviewer_options[idx])
+
+                if len(selected_interviewers) == 1:
+                    st.info(f"📋 Will send **{selected_interviewers[0]['name']}**'s slots and CC them")
+                elif len(selected_interviewers) > 1:
+                    names = ", ".join([i['name'] for i in selected_interviewers])
+                    st.info(f"📋 Will send slots where **all {len(selected_interviewers)} interviewers** are available ({names})")
+                else:
+                    st.warning("Please select at least one interviewer")
+
+            elif len(interviewers_with_slots) == 1:
+                # Single interviewer - auto-select
+                selected_interviewers = [{
+                    "id": interviewers_with_slots[0]["id"],
+                    "name": interviewers_with_slots[0].get("name") or interviewers_with_slots[0].get("email") or "Interviewer",
+                    "email": interviewers_with_slots[0].get("email", ""),
+                    "slots": interviewers_with_slots[0].get("slots", []),
+                }]
+
             # Generate branded email to candidate
             if st.button("Generate Candidate Scheduling Email"):
                 company = get_company_config()
-                html_body = build_branded_email_html(
-                    candidate_name=candidate_name,
-                    role_title=role_title or "Position",
-                    slots=st.session_state["slots"],
-                    company=company,
-                )
-                plain_body = build_branded_email_plain(
-                    candidate_name=candidate_name,
-                    role_title=role_title or "Position",
-                    slots=st.session_state["slots"],
-                    company=company,
-                )
-                st.session_state["candidate_email_html"] = html_body
-                st.session_state["candidate_email_plain"] = plain_body
+
+                # Determine which slots to use based on selected interviewers
+                if not selected_interviewers:
+                    st.error("Please select at least one interviewer.")
+                    source_slots = []
+                elif len(selected_interviewers) == 1:
+                    # Single interviewer - use their slots directly
+                    source_slots = selected_interviewers[0].get("slots", [])
+                else:
+                    # Multiple interviewers - find intersection of their slots
+                    # A slot is available if all selected interviewers have it
+                    def slot_key(s):
+                        return (s["date"], s["start"], s["end"])
+
+                    # Start with first interviewer's slots
+                    common_keys = set(slot_key(s) for s in selected_interviewers[0].get("slots", []))
+
+                    # Intersect with each other interviewer's slots
+                    for interviewer in selected_interviewers[1:]:
+                        interviewer_keys = set(slot_key(s) for s in interviewer.get("slots", []))
+                        common_keys = common_keys.intersection(interviewer_keys)
+
+                    # Get the actual slot objects for common keys
+                    source_slots = [
+                        s for s in selected_interviewers[0].get("slots", [])
+                        if slot_key(s) in common_keys
+                    ]
+
+                    if not source_slots:
+                        st.warning(f"No common slots found where all {len(selected_interviewers)} interviewers are available.")
+
+                if not source_slots:
+                    st.error("No slots available for the selected interviewer. Please add availability first.")
+                else:
+                    # Split slots by duration for email (ensures discrete meeting slots)
+                    email_slots = []
+                    duration = st.session_state.get("duration_minutes", 30)
+                    for slot in source_slots:
+                        split_result = split_slot_by_duration(slot, duration)
+                        if split_result:
+                            for ss in split_result:
+                                # Preserve metadata
+                                for key in slot:
+                                    if key not in ss:
+                                        ss[key] = slot[key]
+                            email_slots.extend(split_result)
+                        else:
+                            email_slots.append(slot)
+
+                    html_body = build_branded_email_html(
+                        candidate_name=candidate_name,
+                        role_title=role_title or "Position",
+                        slots=email_slots,
+                        company=company,
+                    )
+                    plain_body = build_branded_email_plain(
+                        candidate_name=candidate_name,
+                        role_title=role_title or "Position",
+                        slots=email_slots,
+                        company=company,
+                    )
+                    st.session_state["candidate_email_html"] = html_body
+                    st.session_state["candidate_email_plain"] = plain_body
+                    st.session_state["candidate_email_generated_at"] = datetime.now().strftime("%H:%M:%S")
+                    # Store selected interviewers for CC (list of dicts with name and email)
+                    st.session_state["email_cc_interviewers"] = [
+                        {"name": i["name"], "email": i["email"]}
+                        for i in selected_interviewers if i.get("email")
+                    ]
+
+                    if len(selected_interviewers) == 1:
+                        interviewer_note = f" (for {selected_interviewers[0]['name']})"
+                    elif len(selected_interviewers) > 1:
+                        names = ", ".join([i['name'] for i in selected_interviewers])
+                        interviewer_note = f" (panel: {names})"
+                    else:
+                        interviewer_note = ""
+                    st.success(f"Generated branded HTML email template with {len(email_slots)} slot(s){interviewer_note}")
 
             if st.session_state.get("candidate_email_html"):
+                gen_time = st.session_state.get("candidate_email_generated_at", "unknown")
+                st.caption(f"📧 Branded HTML email template (generated at {gen_time})")
+
                 # Preview mode toggle
                 preview_mode = st.radio(
                     "Preview mode",
@@ -3285,18 +4030,53 @@ def main() -> None:
                 else:
                     st.text_area("Email preview (Plain Text)", st.session_state["candidate_email_plain"], height=300)
 
+                # Determine CC recipients - interviewers whose slots are being sent + recruiter
+                cc_interviewers = st.session_state.get("email_cc_interviewers", [])
+
+                # Build CC list
+                cc_list = []
+                cc_display = []
+                cc_emails_added = set()
+
+                # Add all selected interviewers to CC
+                for interviewer in cc_interviewers:
+                    email = interviewer.get("email", "")
+                    name = interviewer.get("name", "")
+                    if email and email.lower() not in cc_emails_added:
+                        cc_list.append(email)
+                        cc_display.append(f"{name} (Interviewer)" if name else email)
+                        cc_emails_added.add(email.lower())
+
+                # Add recruiter if not already in CC
+                if recruiter_email and recruiter_email.lower() not in cc_emails_added:
+                    cc_list.append(recruiter_email)
+                    cc_display.append(f"{recruiter_email} (Recruiter)")
+
+                # Show recipient info before send for verification
+                cc_text = f" (CC: {', '.join(cc_display)})" if cc_display else ""
+                st.info(f"📧 Email will be sent to: **{candidate_email}**{cc_text}")
+
                 company = get_company_config()
                 if st.button("Send Email"):
                     # Validate recipient before attempting to send
                     if not candidate_email:
                         st.error("Candidate email is required. Please enter a valid email address above.")
                     else:
+                        html_body = st.session_state["candidate_email_html"]
+                        plain_body = st.session_state.get("candidate_email_plain")
+
+                        # Debug: verify HTML structure
+                        is_valid_html = html_body.strip().startswith("<!DOCTYPE html>")
+                        if not is_valid_html:
+                            st.warning("Warning: Email body doesn't appear to be valid HTML. Please regenerate the template.")
+
                         ok = send_email_graph(
                             subject=f"Interview Opportunity at {company.name}: {role_title}",
-                            body=st.session_state["candidate_email_html"],
+                            body=html_body,
                             to_emails=[candidate_email],
-                            cc_emails=[recruiter_email] if recruiter_email else None,
+                            cc_emails=cc_list if cc_list else None,
                             content_type="HTML",
+                            plain_text_body=plain_body,
                         )
                         audit.log(
                             "graph_sent_scheduling_email" if ok else "graph_send_failed",
@@ -3305,7 +4085,10 @@ def main() -> None:
                             hiring_manager_email=hiring_manager_email or "",
                             recruiter_email=recruiter_email or "",
                             role_title=role_title or "",
-                            payload={"subject": f"Interview Opportunity at {company.name}: {role_title}"},
+                            payload={
+                                "subject": f"Interview Opportunity at {company.name}: {role_title}",
+                                "cc_interviewers": [i.get("email") for i in cc_interviewers],
+                            },
                             status="success" if ok else "failed",
                             error_message="" if ok else "Graph email send failed",
                         )
@@ -3332,29 +4115,72 @@ def main() -> None:
             if len(valid_candidates) > 1:
                 button_text = f"Create & Send {len(valid_candidates)} Interview Invite(s)"
 
-            if st.button(button_text, disabled=create_disabled):
-                with st.spinner(f"Scheduling {len(valid_candidates)} interview(s)..."):
-                    results = _handle_multi_candidate_invite(
-                        audit=audit,
+            # Validate Before Send button
+            col_validate, col_send = st.columns([1, 2])
+            with col_validate:
+                if st.button("Validate Before Send", disabled=create_disabled, help="Preview who will receive invites"):
+                    report = _validate_invite_flow(
                         selected_slot=selected_slot,
                         tz_name=tz_name,
                         candidate_timezone=candidate_timezone,
                         duration_minutes=int(st.session_state["duration_minutes"]),
-                        role_title=role_title,
-                        subject=subject,
-                        agenda=agenda,
-                        location=location,
-                        is_teams=is_teams,
                         candidates=valid_candidates,
                         hiring_manager=(hiring_manager_email, hiring_manager_name),
                         recruiter=(recruiter_email, recruiter_name),
                         include_recruiter=include_recruiter,
                         panel_interviewers=panel_interviewers_for_invite if panel_interviewers_for_invite else None,
-                        scheduling_mode=scheduling_mode,
+                        is_teams=is_teams,
+                        role_title=role_title,
                     )
 
-                # Display batch results
-                _render_batch_results(results)
+                    # Display validation report
+                    if report.is_valid:
+                        st.success(report.summary)
+                    else:
+                        st.error(report.summary)
+
+                    # Show intended recipients
+                    if report.intended_recipients:
+                        st.markdown("**Invites will be sent to:**")
+                        for recipient in report.intended_recipients:
+                            st.markdown(f"- {recipient}")
+
+                    # Show errors
+                    if report.errors:
+                        st.markdown("**Errors (must fix):**")
+                        for err in report.errors:
+                            st.error(err)
+
+                    # Show warnings
+                    if report.warnings:
+                        st.markdown("**Warnings:**")
+                        for w in report.warnings:
+                            st.warning(w)
+
+            with col_send:
+                if st.button(button_text, disabled=create_disabled):
+                    with st.spinner(f"Scheduling {len(valid_candidates)} interview(s)..."):
+                        results = _handle_multi_candidate_invite(
+                            audit=audit,
+                            selected_slot=selected_slot,
+                            tz_name=tz_name,
+                            candidate_timezone=candidate_timezone,
+                            duration_minutes=int(st.session_state["duration_minutes"]),
+                            role_title=role_title,
+                            subject=subject,
+                            agenda=agenda,
+                            location=location,
+                            is_teams=is_teams,
+                            candidates=valid_candidates,
+                            hiring_manager=(hiring_manager_email, hiring_manager_name),
+                            recruiter=(recruiter_email, recruiter_name),
+                            include_recruiter=include_recruiter,
+                            panel_interviewers=panel_interviewers_for_invite if panel_interviewers_for_invite else None,
+                            scheduling_mode=scheduling_mode,
+                        )
+
+                    # Display batch results
+                    _render_batch_results(results)
 
             # ICS fallback download button (available after generation)
             if st.session_state.get("last_invite_ics_bytes"):
@@ -3405,29 +4231,159 @@ def main() -> None:
 
     # ========= TAB: Scheduler Inbox =========
     with tab_inbox:
-        st.subheader("Scheduler Inbox")
-        st.caption("Reads unread emails from the scheduler mailbox via Microsoft Graph API.")
-        emails, graph_error, is_configured = fetch_unread_emails_graph()
+        # Header with refresh button
+        header_col1, header_col2 = st.columns([3, 1])
+        with header_col1:
+            st.subheader("Scheduler Inbox")
+        with header_col2:
+            if st.button("Refresh Inbox", key="refresh_inbox", type="primary"):
+                st.rerun()
+
+        # Filter options
+        col_filter1, col_filter2 = st.columns(2)
+        with col_filter1:
+            hide_bounces = st.checkbox("Hide bounce/undeliverable messages", value=True)
+        with col_filter2:
+            include_read = st.checkbox("Include already-read messages", value=False)
+
+        # Try IMAP first (Gmail), fall back to Graph API (Office 365)
+        emails, error, is_configured = fetch_emails_imap(include_read=include_read)
+        email_source = "Gmail (IMAP)"
+
         if not is_configured:
-            st.warning("Graph API is not configured. Add graph_tenant_id, graph_client_id, graph_client_secret, and graph_scheduler_mailbox to your secrets.")
-        elif graph_error:
-            st.error(f"Failed to fetch emails: {graph_error}")
+            # Fall back to Graph API
+            emails, error, is_configured = fetch_unread_emails_graph(include_read=include_read)
+            email_source = "Office 365 (Graph API)"
+
+        # Get current time for "last fetched" display
+        fetch_time = datetime.now().strftime("%I:%M:%S %p")
+
+        if not is_configured:
+            st.warning("Email inbox not configured. Add IMAP settings (imap_host, imap_username, imap_password) for Gmail, or Graph API settings for Office 365.")
+        elif error:
+            st.caption(f"Reading emails via {email_source} | Last fetched: {fetch_time}")
+            st.error(f"Failed to fetch emails: {error}")
         elif not emails:
+            st.caption(f"Reading emails via {email_source} | Last fetched: {fetch_time}")
             st.success("✓ Connected to mailbox. No unread emails found.")
         else:
-            st.write(f"Found {len(emails)} unread email(s).")
-            for i, e in enumerate(emails, start=1):
-                with st.expander(f"{i}. {e['subject'] or '(no subject)'} — {e['from']}"):
-                    st.write(e.get("date", ""))
-                    body = e.get("body", "")
-                    st.text_area("Body", body, height=160)
+            st.caption(f"Reading emails via {email_source} | Last fetched: {fetch_time}")
+            # Filter out bounce messages if requested
+            if hide_bounces:
+                filtered_emails = [
+                    e for e in emails
+                    if not (
+                        e.get("subject", "").lower().startswith("undeliverable") or
+                        "postmaster" in e.get("from", "").lower() or
+                        "mailer-daemon" in e.get("from", "").lower() or
+                        "microsoftexchange" in e.get("from", "").lower()
+                    )
+                ]
+                bounce_count = len(emails) - len(filtered_emails)
+                if bounce_count > 0:
+                    st.info(f"Hiding {bounce_count} bounce/undeliverable message(s)")
+                emails = filtered_emails
 
-                    if st.session_state["slots"]:
-                        choice = detect_slot_choice_from_text(body, st.session_state["slots"])
-                        if choice:
-                            st.success(f"Detected slot choice: {choice.get('date')} {choice.get('start')}")
-                        else:
-                            st.info("No slot choice detected from this email.")
+            if not emails:
+                st.success("✓ No candidate replies found (after filtering).")
+            else:
+                st.write(f"Found {len(emails)} email(s).")
+
+            for i, e in enumerate(emails, start=1):
+                read_status = "[READ]" if e.get("is_read") else "[NEW]"
+                with st.expander(f"{i}. {read_status} {e['subject'] or '(no subject)'} — {e['from']}"):
+                    st.write(e.get("date", ""))
+                    preview_body = e.get("body", "")
+                    full_body = e.get("full_body", preview_body)  # Fall back to preview if full not available
+                    st.text_area("Body Preview", preview_body, height=160, key=f"inbox_body_{i}")
+
+                    # Show full body info for debugging
+                    slots_in_session = len(st.session_state.get("slots", []))
+                    email_slots = _extract_slots_from_email_body(full_body)
+                    slots_in_email = len(email_slots)
+                    st.caption(f"Full body: {len(full_body):,} chars | Session slots: {slots_in_session} | Email slots: {slots_in_email}")
+
+                    candidate_email = e.get("from", "")
+
+                    # Try slot detection - works even if session slots are empty (extracts from email)
+                    choice = detect_slot_choice_from_text(full_body, st.session_state.get("slots", []))
+                    if choice:
+                        st.success(f"Detected slot choice: {choice.get('date')} {choice.get('start')}-{choice.get('end')}")
+
+                        # Show confirm button to send calendar invite
+                        col1, col2 = st.columns([2, 1])
+                        with col1:
+                            st.info(f"Ready to send invite to: {candidate_email}")
+                        with col2:
+                            if st.button(f"Confirm & Send Invite", key=f"confirm_slot_{i}"):
+                                # Get current form values from session state
+                                hm_email = st.session_state.get("hiring_manager_email", "")
+                                hm_name = st.session_state.get("hiring_manager_name", "")
+                                rec_email = st.session_state.get("recruiter_email", "")
+                                rec_name = st.session_state.get("recruiter_name", "")
+                                role_title = st.session_state.get("role_title", "")
+                                duration = int(st.session_state.get("duration_minutes", 60))
+                                tz_name = st.session_state.get("tz_name", "UTC")
+                                candidate_tz = st.session_state.get("candidate_timezone", tz_name)
+                                is_teams = st.session_state.get("is_teams", True)
+                                subject = st.session_state.get("subject", "")
+                                agenda = st.session_state.get("agenda", "")
+                                location = st.session_state.get("location", "")
+                                include_recruiter = st.session_state.get("include_recruiter", False)
+                                panel_interviewers = st.session_state.get("panel_interviewers", [])
+
+                                # Validate we have minimum required info
+                                if not hm_email and not panel_interviewers:
+                                    st.error("Please set hiring manager email or panel interviewers in the New Scheduling Request tab first.")
+                                else:
+                                    # Parse candidate name from email if possible
+                                    candidate_name = _ensure_candidate_name("", candidate_email)
+
+                                    # Create the invite
+                                    with st.spinner("Sending calendar invite..."):
+                                        result = _create_individual_invite(
+                                            audit=audit,
+                                            selected_slot=choice,
+                                            tz_name=tz_name,
+                                            candidate_timezone=candidate_tz,
+                                            duration_minutes=duration,
+                                            role_title=role_title,
+                                            subject=subject,
+                                            agenda=agenda,
+                                            location=location,
+                                            is_teams=is_teams,
+                                            candidate=(candidate_email, candidate_name),
+                                            hiring_manager=(hm_email, hm_name),
+                                            recruiter=(rec_email, rec_name),
+                                            include_recruiter=include_recruiter,
+                                            panel_interviewers=[
+                                                {"name": p.get("name", ""), "email": p.get("email", "")}
+                                                for p in panel_interviewers if p.get("email")
+                                            ] if panel_interviewers else None,
+                                        )
+
+                                    if result.success:
+                                        st.success(f"Calendar invite sent to {candidate_email}!")
+                                        if result.recipients:
+                                            st.caption(f"All recipients: {', '.join(result.recipients)}")
+                                        # Debug: show if Teams was requested
+                                        st.caption(f"Teams meeting requested: {is_teams}")
+                                        if result.teams_url:
+                                            st.link_button("Open Teams Link", result.teams_url)
+                                        else:
+                                            st.caption("No Teams URL in result")
+                                        if result.warnings:
+                                            for w in result.warnings:
+                                                st.warning(w)
+                                        # Mark email as read after successful invite
+                                        email_id = e.get("id", "")
+                                        if email_id:
+                                            if mark_email_read_imap(email_id):
+                                                st.caption("Email marked as read")
+                                    else:
+                                        st.error(f"Failed to send invite: {result.error}")
+                    else:
+                        st.info("No slot choice detected from this email.")
 
     # ========= TAB: Calendar Invites =========
     with tab_invites:
@@ -4144,6 +5100,77 @@ def main() -> None:
                     audit.log("graph_calendar_read_failed", payload=e.response_json, status="failed", error_message=str(e))
 
             st.markdown("----")
+            st.markdown("#### Test Teams Meeting Creation")
+            st.caption("Test if the Graph API can create events with Teams meetings")
+
+            if st.button("Test Teams Meeting"):
+                try:
+                    import time as time_module
+                    dt = datetime.now().replace(second=0, microsecond=0) + timedelta(hours=2)
+                    tz = get_default_timezone()
+                    start_dt = {"dateTime": dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz}
+                    end_dt = {"dateTime": (dt + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz}
+
+                    payload = {
+                        "subject": "PowerDash Teams Test (will be deleted)",
+                        "body": {"contentType": "HTML", "content": "Test event to verify Teams meeting creation."},
+                        "start": start_dt,
+                        "end": end_dt,
+                        "isOnlineMeeting": True,
+                        "onlineMeetingProvider": "teamsForBusiness",
+                        "location": {"displayName": "Microsoft Teams"},
+                        "attendees": [],
+                    }
+
+                    st.write("Creating test event with Teams meeting...")
+                    created = client.create_event(payload)
+                    event_id = created.get("id", "")
+
+                    st.write("**Initial response:**")
+                    st.json({
+                        "id": event_id,
+                        "isOnlineMeeting": created.get("isOnlineMeeting"),
+                        "onlineMeetingProvider": created.get("onlineMeetingProvider"),
+                        "onlineMeeting": created.get("onlineMeeting"),
+                        "webLink": created.get("webLink"),
+                    })
+
+                    teams_url = ""
+                    if created.get("onlineMeeting"):
+                        teams_url = created.get("onlineMeeting", {}).get("joinUrl", "")
+
+                    if not teams_url:
+                        st.write("No Teams URL in initial response. Waiting 3 seconds and fetching again...")
+                        time_module.sleep(3)
+                        refreshed = client.get_event(event_id)
+                        st.write("**Refreshed response:**")
+                        st.json({
+                            "id": refreshed.get("id"),
+                            "isOnlineMeeting": refreshed.get("isOnlineMeeting"),
+                            "onlineMeetingProvider": refreshed.get("onlineMeetingProvider"),
+                            "onlineMeeting": refreshed.get("onlineMeeting"),
+                            "webLink": refreshed.get("webLink"),
+                        })
+                        if refreshed.get("onlineMeeting"):
+                            teams_url = refreshed.get("onlineMeeting", {}).get("joinUrl", "")
+
+                    if teams_url:
+                        st.success(f"Teams URL found: {teams_url}")
+                    else:
+                        st.warning("No Teams URL returned. This may indicate a permissions or licensing issue.")
+
+                    # Clean up - delete the test event
+                    st.write("Cleaning up test event...")
+                    client.delete_event(event_id)
+                    st.success("Test event deleted")
+
+                except GraphAPIError as e:
+                    st.error(f"Graph API Error: {e}")
+                    st.json(e.response_json)
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+            st.markdown("----")
             st.markdown("#### Dummy event (optional)")
             dry_run = st.checkbox("Dry run (do not create)", value=True)
             tz_name = st.selectbox("Timezone", options=_common_timezones(), index=_common_timezones().index(get_default_timezone()) if get_default_timezone() in _common_timezones() else 0)
@@ -4269,8 +5296,24 @@ def _parse_single_interviewer_availability(interviewer_idx: int) -> None:
             display_timezone=tz_name,
             interviewer_names=interviewer_names_map,
         )
-        st.session_state["computed_intersections"] = intersections
-        st.session_state["slots"] = intersections
+
+        # Split continuous windows into discrete meeting-sized slots
+        split_intersections = []
+        for slot in intersections:
+            split_slots = split_slot_by_duration(slot, min_duration)
+            if split_slots:
+                # Preserve metadata from original slot in each split slot
+                for ss in split_slots:
+                    for key in slot:
+                        if key not in ss:
+                            ss[key] = slot[key]
+                split_intersections.extend(split_slots)
+            else:
+                # Keep original if splitting returns empty (edge case)
+                split_intersections.append(slot)
+
+        st.session_state["computed_intersections"] = split_intersections
+        st.session_state["slots"] = split_intersections
         _save_persisted_slots()
 
 
@@ -4312,19 +5355,10 @@ def _parse_all_panel_availability() -> None:
                     s["source"] = "uploaded"
                 total_uploaded += len(uploaded_slots)
                 # Merge manual + uploaded, preferring manual for duplicates
-                merged_slots = _merge_slots(existing_manual_slots, uploaded_slots)
-
-                # Split continuous windows into discrete meeting-sized slots
-                split_slots = []
-                for s in merged_slots:
-                    split_slots.extend(split_slot_by_duration(s, min_duration))
-                interviewer["slots"] = split_slots if split_slots else merged_slots
+                interviewer["slots"] = _merge_slots(existing_manual_slots, uploaded_slots)
             elif existing_manual_slots:
-                # No file but has manual slots - split them too
-                split_slots = []
-                for s in existing_manual_slots:
-                    split_slots.extend(split_slot_by_duration(s, min_duration))
-                interviewer["slots"] = split_slots if split_slots else existing_manual_slots
+                # No file but has manual slots - keep them
+                interviewer["slots"] = existing_manual_slots
 
             # Include interviewer if they have any slots
             if interviewer.get("slots"):
@@ -4353,10 +5387,26 @@ def _parse_all_panel_availability() -> None:
             display_timezone=tz_name,
             interviewer_names=interviewer_names,
         )
-        st.session_state["computed_intersections"] = intersections
+
+        # Split continuous windows into discrete meeting-sized slots
+        split_intersections = []
+        for slot in intersections:
+            split_slots = split_slot_by_duration(slot, min_duration)
+            if split_slots:
+                # Preserve metadata from original slot in each split slot
+                for ss in split_slots:
+                    for key in slot:
+                        if key not in ss:
+                            ss[key] = slot[key]
+                split_intersections.extend(split_slots)
+            else:
+                # Keep original if splitting returns empty (edge case)
+                split_intersections.append(slot)
+
+        st.session_state["computed_intersections"] = split_intersections
 
         # Also update legacy "slots" for backward compatibility
-        st.session_state["slots"] = intersections
+        st.session_state["slots"] = split_intersections
         _save_persisted_slots()
 
         num_interviewers = len(all_interviewer_slots)
@@ -4447,6 +5497,16 @@ def _render_batch_results(results: List[SchedulingResult]) -> None:
             for r in successful:
                 display = f"{r.candidate_name} ({r.candidate_email})" if r.candidate_name else r.candidate_email
                 st.markdown(f":white_check_mark: **{display}**")
+
+                # Show recipients
+                if r.recipients:
+                    st.caption(f"Invites sent to: {', '.join(r.recipients)}")
+
+                # Show warnings
+                if r.warnings:
+                    for w in r.warnings:
+                        st.warning(w, icon="warning")
+
                 if r.teams_url:
                     st.link_button("Open Teams Link", r.teams_url, key=f"teams_{r.event_id}_{r.candidate_email}")
 
@@ -4540,6 +5600,142 @@ def _handle_multi_candidate_invite(
     return results
 
 
+@dataclass
+class ValidationReport:
+    """Result of validating invite parameters without sending."""
+    is_valid: bool
+    intended_recipients: List[str]
+    errors: List[str]
+    warnings: List[str]
+    summary: str
+
+
+def _validate_invite_flow(
+    *,
+    selected_slot: Optional[Dict[str, str]],
+    tz_name: str,
+    candidate_timezone: str,
+    duration_minutes: int,
+    role_title: str,
+    candidates: List[CandidateValidationResult],
+    hiring_manager: Tuple[str, str],
+    recruiter: Tuple[str, str],
+    include_recruiter: bool,
+    panel_interviewers: Optional[List[Dict[str, str]]] = None,
+    is_teams: bool = False,
+) -> ValidationReport:
+    """
+    Dry-run validation of invite parameters without sending.
+    Returns a validation report with all intended recipients, errors, and warnings.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    intended_recipients: List[str] = []
+
+    hm_email_raw, hm_name = hiring_manager
+    rec_email_raw, rec_name = recruiter
+
+    # Validate role title
+    if not role_title or not role_title.strip():
+        warnings.append("Role/position title is empty - subject will use generic 'Interview' text")
+
+    # Validate timezone
+    if not is_valid_timezone(tz_name):
+        warnings.append(f"Display timezone '{tz_name}' is invalid, will use UTC")
+
+    if not is_valid_timezone(candidate_timezone):
+        warnings.append(f"Candidate timezone '{candidate_timezone}' is invalid, will use display timezone")
+
+    # Validate candidates
+    valid_candidates = [c for c in candidates if c.is_valid and c.email]
+    invalid_candidates = [c for c in candidates if not c.is_valid]
+
+    if not valid_candidates:
+        errors.append("No valid candidate emails provided")
+    else:
+        for c in valid_candidates:
+            intended_recipients.append(c.email)
+
+    for c in invalid_candidates:
+        warnings.append(f"Invalid candidate email skipped: {c.original} - {c.error}")
+
+    # Validate hiring manager
+    try:
+        if panel_interviewers:
+            hm_email = validate_email_optional(hm_email_raw, "Hiring manager email")
+        else:
+            hm_email = validate_email(hm_email_raw, "Hiring manager email")
+        if hm_email:
+            intended_recipients.append(hm_email)
+    except ValidationError as e:
+        errors.append(str(e))
+        hm_email = None
+
+    # Validate recruiter
+    rec_email = None
+    if include_recruiter and rec_email_raw:
+        try:
+            rec_email = validate_email_optional(rec_email_raw, "Recruiter email")
+            if rec_email:
+                intended_recipients.append(rec_email)
+        except ValidationError as e:
+            warnings.append(f"Invalid recruiter email: {e}")
+
+    # Validate panel interviewers
+    if panel_interviewers:
+        seen_emails = {(c.email or "").lower() for c in valid_candidates}
+        if hm_email:
+            seen_emails.add(hm_email.lower())
+
+        for pi in panel_interviewers:
+            pi_email = (pi.get("email") or "").strip().lower()
+            pi_name = pi.get("name", "")
+            if pi_email and pi_email not in seen_emails:
+                try:
+                    validated_email = validate_email(pi_email, "Panel interviewer email")
+                    intended_recipients.append(validated_email)
+                    seen_emails.add(validated_email.lower())
+                except ValidationError as ve:
+                    warnings.append(f"Invalid panel email '{pi_email}': {ve.message}")
+
+    # Validate slot
+    if not selected_slot:
+        errors.append("No time slot selected")
+    else:
+        try:
+            validate_slot(selected_slot)
+            # Try to parse the datetime
+            datetime.fromisoformat(f"{selected_slot['date']}T{selected_slot['start']}:00")
+        except ValidationError as e:
+            errors.append(f"Invalid slot: {e.message}")
+        except ValueError as e:
+            errors.append(f"Invalid date/time format: {e}")
+
+    # Check Graph API configuration
+    client = _make_graph_client()
+    if not client:
+        warnings.append("Graph API not configured - invites will fail unless configured")
+
+    # Check Teams meeting capability
+    if is_teams and not client:
+        warnings.append("Teams meeting requested but Graph API is not available")
+
+    # Build summary
+    is_valid = len(errors) == 0
+    if is_valid:
+        summary = f"Ready to send invites to {len(intended_recipients)} recipient(s)"
+    else:
+        summary = f"Cannot send: {len(errors)} error(s) found"
+
+    return ValidationReport(
+        is_valid=is_valid,
+        intended_recipients=intended_recipients,
+        errors=errors,
+        warnings=warnings,
+        summary=summary,
+    )
+
+
 def _create_individual_invite(
     *,
     audit: AuditLog,
@@ -4587,7 +5783,9 @@ def _create_individual_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=str(e)  # Include field name in error message
+            error=str(e),  # Include field name in error message
+            warnings=None,
+            recipients=None,
         )
 
     try:
@@ -4599,7 +5797,9 @@ def _create_individual_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=f"Invalid slot: {e.message}"
+            error=f"Invalid slot: {e.message}",
+            warnings=None,
+            recipients=None,
         )
 
     # Parse selected slot into a local datetime
@@ -4612,7 +5812,9 @@ def _create_individual_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=f"Invalid date/time format: {e}"
+            error=f"Invalid date/time format: {e}",
+            warnings=None,
+            recipients=None,
         )
 
     zi, _ = safe_zoneinfo(tz_name, fallback="UTC")
@@ -4621,36 +5823,56 @@ def _create_individual_invite(
     start_utc = to_utc(start_local)
     end_utc = to_utc(end_local)
 
-    # Build attendees list
+    # Build attendees list - candidate and hiring manager are required (To:)
     attendees: List[Tuple[str, str]] = [(candidate_email, candidate_name)]
+    seen_emails: set = {candidate_email.lower()}
     is_panel = panel_interviewers and len(panel_interviewers) > 1
     validated_panel: List[Dict[str, str]] = []
+    skipped_panel_members: List[str] = []
+    cc_attendees: List[Tuple[str, str]] = []  # Interviewers go in CC
 
+    # ALWAYS add hiring manager as required attendee (if valid and not duplicate)
+    if hm_email and hm_email.lower() not in seen_emails:
+        attendees.append((hm_email, hm_name))
+        seen_emails.add(hm_email.lower())
+
+    # Add panel interviewers to CC (optional attendees) with deduplication
     if panel_interviewers:
-        seen_emails = {candidate_email}
         for pi in panel_interviewers:
             pi_email = (pi.get("email") or "").strip().lower()
             if pi_email and pi_email not in seen_emails:
                 try:
                     validated_email = validate_email(pi_email, "Panel interviewer email")
                     validated_panel.append({"name": pi.get("name", ""), "email": validated_email})
-                    attendees.append((validated_email, pi.get("name", "")))
-                    seen_emails.add(validated_email)
-                except ValidationError:
-                    pass
-    else:
-        attendees.append((hm_email, hm_name))
+                    cc_attendees.append((validated_email, pi.get("name", "")))  # CC instead of required
+                    seen_emails.add(validated_email.lower())
+                except ValidationError as ve:
+                    skipped_panel_members.append(f"{pi_email}: {ve.message}")
 
-    if include_recruiter and rec_email:
-        attendees.append((rec_email, rec_name))
+    # Optionally add recruiter to CC
+    if include_recruiter and rec_email and rec_email.lower() not in seen_emails:
+        cc_attendees.append((rec_email, rec_name))  # CC instead of required
+        seen_emails.add(rec_email.lower())
 
     organizer_email = str(get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"))
     organizer_name = "PowerDash Scheduler"
 
+    # Ensure we have a display name for subject
+    effective_name = _ensure_candidate_name(candidate_name, candidate_email)
+    has_role = role_title and role_title.strip()
+
     effective_subject = subject
     if is_panel:
         if not subject.startswith("Panel Interview"):
-            effective_subject = f"Panel Interview: {role_title} - {candidate_name}"
+            if has_role:
+                effective_subject = f"Panel Interview: {role_title.strip()} - {effective_name}"
+            else:
+                effective_subject = f"Panel Interview with {effective_name}"
+    elif not subject:
+        if has_role:
+            effective_subject = f"Interview: {role_title.strip()} - {effective_name}"
+        else:
+            effective_subject = f"Interview with {effective_name}"
 
     # Generate ICS fallback
     ics_bytes = _build_ics(
@@ -4677,22 +5899,23 @@ def _create_individual_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error="Graph API not configured"
+            error="Graph API not configured",
+            warnings=None,
+            recipients=None,
         )
 
     # Format time display for candidate's timezone
     from timezone_utils import format_datetime_for_display
     candidate_time_display = format_datetime_for_display(start_utc, candidate_timezone)
 
-    body_html = f"<p><strong>Interview Time (your timezone): {candidate_time_display}</strong></p>"
-    if is_panel and validated_panel:
-        body_html += "<p><strong>Interview Panel:</strong></p><ul>"
-        for pi in validated_panel:
-            name = pi.get("name") or pi.get("email", "")
-            body_html += f"<li>{name}</li>"
-        body_html += "</ul>"
-    if agenda:
-        body_html += f"<p>{agenda.replace(chr(10), '<br>')}</p>"
+    # Build professional HTML body using helper
+    body_html = _build_professional_invite_body(
+        time_display=candidate_time_display,
+        role_title=role_title,
+        duration_minutes=duration_minutes,
+        panel_members=validated_panel if is_panel else None,
+        agenda=agenda,
+    )
 
     payload = _graph_event_payload(
         subject=effective_subject,
@@ -4701,16 +5924,89 @@ def _create_individual_invite(
         end_local=end_local,
         time_zone=candidate_timezone,
         attendees=attendees,
+        cc_attendees=cc_attendees,  # Interviewers in CC
         is_teams=is_teams,
         location=location,
+    )
+
+    # Log payload for debugging Teams issues
+    log_structured(
+        LogLevel.INFO,
+        f"Creating individual event with is_teams={is_teams}",
+        action="create_individual_event",
+        details={
+            "is_teams": is_teams,
+            "isOnlineMeeting": payload.get("isOnlineMeeting"),
+            "onlineMeetingProvider": payload.get("onlineMeetingProvider"),
+            "attendee_count": len(attendees),
+        },
     )
 
     try:
         created = client.create_event(payload)
         event_id = created.get("id", "")
         teams_url = ""
+        warnings: List[str] = []
+
+        # Add warnings for skipped panel members
+        if skipped_panel_members:
+            warnings.append(f"Skipped invalid panel emails: {', '.join(skipped_panel_members)}")
+
         if is_teams:
-            teams_url = (created.get("onlineMeeting") or {}).get("joinUrl") or ""
+            online_meeting = created.get("onlineMeeting")
+            if online_meeting:
+                teams_url = online_meeting.get("joinUrl") or ""
+
+            # Try alternative locations for Teams URL
+            if not teams_url:
+                # Check webLink field
+                web_link = created.get("webLink", "")
+                if web_link and "teams.microsoft.com" in web_link:
+                    teams_url = web_link
+
+            # If Teams URL not in initial response, wait and fetch the event again
+            # (Graph API sometimes needs a moment to generate the Teams meeting)
+            if not teams_url and event_id:
+                import time
+                time.sleep(2)  # Wait 2 seconds for Teams meeting to be provisioned
+                try:
+                    refreshed = client.get_event(event_id)
+                    online_meeting = refreshed.get("onlineMeeting")
+                    if online_meeting:
+                        teams_url = online_meeting.get("joinUrl") or ""
+                    # Also check webLink in refreshed response
+                    if not teams_url:
+                        web_link = refreshed.get("webLink", "")
+                        if web_link and "teams.microsoft.com" in web_link:
+                            teams_url = web_link
+                except Exception:
+                    pass  # Ignore errors on retry, we'll show warning below
+
+            if not teams_url:
+                # Log what we got from Graph for debugging
+                log_structured(
+                    LogLevel.WARNING,
+                    "Teams URL not found in Graph response",
+                    action="create_event_teams",
+                    details={
+                        "has_onlineMeeting": created.get("onlineMeeting") is not None,
+                        "onlineMeeting_keys": list(created.get("onlineMeeting", {}).keys()) if created.get("onlineMeeting") else [],
+                        "has_webLink": bool(created.get("webLink")),
+                        "isOnlineMeeting": created.get("isOnlineMeeting"),
+                    },
+                )
+                warnings.append("Teams meeting was requested but no join URL was returned")
+
+        # Validate Graph response contains expected attendees
+        response_attendees = created.get("attendees", [])
+        response_emails = {
+            (a.get("emailAddress", {}).get("address") or "").lower()
+            for a in response_attendees
+        }
+        expected_emails = {email.lower() for email, _ in attendees}
+        missing = expected_emails - response_emails
+        if missing:
+            warnings.append(f"Some attendees may not be on invite: {', '.join(missing)}")
 
         # Serialize panel interviewers for database storage
         panel_json = ""
@@ -4753,7 +6049,9 @@ def _create_individual_invite(
             success=True,
             event_id=event_id,
             teams_url=teams_url,
-            error=None
+            error=None,
+            warnings=warnings if warnings else None,
+            recipients=[a[0] for a in attendees] + [a[0] for a in cc_attendees],
         )
 
     except (GraphAuthError, GraphAPIError) as e:
@@ -4775,7 +6073,9 @@ def _create_individual_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=str(e)
+            error=str(e),
+            warnings=None,
+            recipients=None,
         )
 
 
@@ -4820,7 +6120,9 @@ def _create_group_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=str(e)  # Include field name in error message
+            error=str(e),  # Include field name in error message
+            warnings=None,
+            recipients=None,
         )
 
     try:
@@ -4832,7 +6134,9 @@ def _create_group_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=f"Invalid slot: {e.message}"
+            error=f"Invalid slot: {e.message}",
+            warnings=None,
+            recipients=None,
         )
 
     # Parse selected slot into a local datetime
@@ -4845,7 +6149,9 @@ def _create_group_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=f"Invalid date/time format: {e}"
+            error=f"Invalid date/time format: {e}",
+            warnings=None,
+            recipients=None,
         )
 
     zi, _ = safe_zoneinfo(tz_name, fallback="UTC")
@@ -4854,36 +6160,47 @@ def _create_group_invite(
     start_utc = to_utc(start_local)
     end_utc = to_utc(end_local)
 
-    # Build attendees list with all valid candidates
+    # Build attendees list - candidates and hiring manager are required (To:)
     valid_candidates = [c for c in candidates if c.is_valid and c.email]
     attendees: List[Tuple[str, str]] = [(c.email, c.name) for c in valid_candidates]
-
+    seen_emails: set = {(c.email or "").lower() for c in valid_candidates}
     is_panel = panel_interviewers and len(panel_interviewers) > 1
     validated_panel: List[Dict[str, str]] = []
+    skipped_panel_members: List[str] = []
+    cc_attendees: List[Tuple[str, str]] = []  # Interviewers go in CC
 
+    # ALWAYS add hiring manager as required attendee (if valid and not duplicate)
+    if hm_email and hm_email.lower() not in seen_emails:
+        attendees.append((hm_email, hm_name))
+        seen_emails.add(hm_email.lower())
+
+    # Add panel interviewers to CC (optional attendees) with deduplication
     if panel_interviewers:
-        seen_emails = {c.email for c in valid_candidates}
         for pi in panel_interviewers:
             pi_email = (pi.get("email") or "").strip().lower()
             if pi_email and pi_email not in seen_emails:
                 try:
                     validated_email = validate_email(pi_email, "Panel interviewer email")
                     validated_panel.append({"name": pi.get("name", ""), "email": validated_email})
-                    attendees.append((validated_email, pi.get("name", "")))
-                    seen_emails.add(validated_email)
-                except ValidationError:
-                    pass
-    else:
-        attendees.append((hm_email, hm_name))
+                    cc_attendees.append((validated_email, pi.get("name", "")))  # CC instead of required
+                    seen_emails.add(validated_email.lower())
+                except ValidationError as ve:
+                    skipped_panel_members.append(f"{pi_email}: {ve.message}")
 
-    if include_recruiter and rec_email:
-        attendees.append((rec_email, rec_name))
+    # Optionally add recruiter to CC
+    if include_recruiter and rec_email and rec_email.lower() not in seen_emails:
+        cc_attendees.append((rec_email, rec_name))  # CC instead of required
+        seen_emails.add(rec_email.lower())
 
     organizer_email = str(get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"))
     organizer_name = "PowerDash Scheduler"
 
     # Use group interview subject
-    effective_subject = f"Group Interview: {role_title}"
+    has_role = role_title and role_title.strip()
+    if has_role:
+        effective_subject = f"Group Interview: {role_title.strip()}"
+    else:
+        effective_subject = "Group Interview"
     if subject and not subject.startswith("Interview:"):
         effective_subject = subject
 
@@ -4918,28 +6235,25 @@ def _create_group_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error="Graph API not configured"
+            error="Graph API not configured",
+            warnings=None,
+            recipients=None,
         )
 
     # Format time display for candidate's timezone
     from timezone_utils import format_datetime_for_display
     candidate_time_display = format_datetime_for_display(start_utc, candidate_timezone)
 
-    body_html = f"<p><strong>Interview Time (your timezone): {candidate_time_display}</strong></p>"
-    body_html += f"<p><strong>Candidates ({len(valid_candidates)}):</strong></p><ul>"
-    for c in valid_candidates:
-        display = c.name if c.name else c.email
-        body_html += f"<li>{display}</li>"
-    body_html += "</ul>"
-
-    if is_panel and validated_panel:
-        body_html += "<p><strong>Interview Panel:</strong></p><ul>"
-        for pi in validated_panel:
-            name = pi.get("name") or pi.get("email", "")
-            body_html += f"<li>{name}</li>"
-        body_html += "</ul>"
-    if agenda:
-        body_html += f"<p>{agenda.replace(chr(10), '<br>')}</p>"
+    # Build professional HTML body using helper
+    candidate_names = [c.name if c.name else c.email for c in valid_candidates]
+    body_html = _build_professional_invite_body(
+        time_display=candidate_time_display,
+        role_title=role_title,
+        duration_minutes=duration_minutes,
+        panel_members=validated_panel if is_panel else None,
+        agenda=agenda,
+        candidates=candidate_names,
+    )
 
     payload = _graph_event_payload(
         subject=effective_subject,
@@ -4948,6 +6262,7 @@ def _create_group_invite(
         end_local=end_local,
         time_zone=candidate_timezone,
         attendees=attendees,
+        cc_attendees=cc_attendees,  # Interviewers in CC
         is_teams=is_teams,
         location=location,
     )
@@ -4956,8 +6271,67 @@ def _create_group_invite(
         created = client.create_event(payload)
         event_id = created.get("id", "")
         teams_url = ""
+        warnings: List[str] = []
+
+        # Add warnings for skipped panel members
+        if skipped_panel_members:
+            warnings.append(f"Skipped invalid panel emails: {', '.join(skipped_panel_members)}")
+
         if is_teams:
-            teams_url = (created.get("onlineMeeting") or {}).get("joinUrl") or ""
+            online_meeting = created.get("onlineMeeting")
+            if online_meeting:
+                teams_url = online_meeting.get("joinUrl") or ""
+
+            # Try alternative locations for Teams URL
+            if not teams_url:
+                # Check webLink field
+                web_link = created.get("webLink", "")
+                if web_link and "teams.microsoft.com" in web_link:
+                    teams_url = web_link
+
+            # If Teams URL not in initial response, wait and fetch the event again
+            # (Graph API sometimes needs a moment to generate the Teams meeting)
+            if not teams_url and event_id:
+                import time
+                time.sleep(2)  # Wait 2 seconds for Teams meeting to be provisioned
+                try:
+                    refreshed = client.get_event(event_id)
+                    online_meeting = refreshed.get("onlineMeeting")
+                    if online_meeting:
+                        teams_url = online_meeting.get("joinUrl") or ""
+                    # Also check webLink in refreshed response
+                    if not teams_url:
+                        web_link = refreshed.get("webLink", "")
+                        if web_link and "teams.microsoft.com" in web_link:
+                            teams_url = web_link
+                except Exception:
+                    pass  # Ignore errors on retry, we'll show warning below
+
+            if not teams_url:
+                # Log what we got from Graph for debugging
+                log_structured(
+                    LogLevel.WARNING,
+                    "Teams URL not found in Graph response",
+                    action="create_event_teams",
+                    details={
+                        "has_onlineMeeting": created.get("onlineMeeting") is not None,
+                        "onlineMeeting_keys": list(created.get("onlineMeeting", {}).keys()) if created.get("onlineMeeting") else [],
+                        "has_webLink": bool(created.get("webLink")),
+                        "isOnlineMeeting": created.get("isOnlineMeeting"),
+                    },
+                )
+                warnings.append("Teams meeting was requested but no join URL was returned")
+
+        # Validate Graph response contains expected attendees
+        response_attendees = created.get("attendees", [])
+        response_emails = {
+            (a.get("emailAddress", {}).get("address") or "").lower()
+            for a in response_attendees
+        }
+        expected_emails = {email.lower() for email, _ in attendees}
+        missing = expected_emails - response_emails
+        if missing:
+            warnings.append(f"Some attendees may not be on invite: {', '.join(missing)}")
 
         # Serialize panel interviewers for database storage
         panel_json = ""
@@ -5003,7 +6377,9 @@ def _create_group_invite(
             success=True,
             event_id=event_id,
             teams_url=teams_url,
-            error=None
+            error=None,
+            warnings=warnings if warnings else None,
+            recipients=[a[0] for a in attendees] + [a[0] for a in cc_attendees],
         )
 
     except (GraphAuthError, GraphAPIError) as e:
@@ -5025,7 +6401,9 @@ def _create_group_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=str(e)
+            error=str(e),
+            warnings=None,
+            recipients=None,
         )
 
 
@@ -5109,21 +6487,27 @@ def _handle_create_invite(
             return
 
     attendees: List[Tuple[str, str]] = [(candidate_email, candidate_name)]
+    cc_attendees: List[Tuple[str, str]] = []  # Interviewers go in CC
 
     # Build attendees from panel interviewers if provided, otherwise use hiring manager
     is_panel = panel_interviewers and len(panel_interviewers) > 1
     validated_panel: List[Dict[str, str]] = []
 
     if panel_interviewers:
-        seen_emails = {candidate_email}  # Avoid duplicating candidate
+        seen_emails = {candidate_email.lower()}  # Avoid duplicating candidate
+        # Add hiring manager as required attendee
+        if hm_email and hm_email.lower() not in seen_emails:
+            attendees.append((hm_email, hm_name))
+            seen_emails.add(hm_email.lower())
+        # Add panel interviewers to CC
         for pi in panel_interviewers:
             pi_email = (pi.get("email") or "").strip().lower()
             if pi_email and pi_email not in seen_emails:
                 try:
                     validated_email = validate_email(pi_email, "Panel interviewer email")
                     validated_panel.append({"name": pi.get("name", ""), "email": validated_email})
-                    attendees.append((validated_email, pi.get("name", "")))
-                    seen_emails.add(validated_email)
+                    cc_attendees.append((validated_email, pi.get("name", "")))  # CC instead of required
+                    seen_emails.add(validated_email.lower())
                 except ValidationError:
                     pass  # Skip invalid emails
     else:
@@ -5131,7 +6515,7 @@ def _handle_create_invite(
         attendees.append((hm_email, hm_name))
 
     if include_recruiter and rec_email:
-        attendees.append((rec_email, rec_name))
+        cc_attendees.append((rec_email, rec_name))  # Recruiter in CC
 
     organizer_email = str(get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"))
     organizer_name = "PowerDash Scheduler"
@@ -5178,19 +6562,14 @@ def _handle_create_invite(
     from timezone_utils import format_datetime_for_display
     candidate_time_display = format_datetime_for_display(start_utc, candidate_timezone)
 
-    # Build body with candidate-friendly time display
-    body_html = f"<p><strong>Interview Time (your timezone): {candidate_time_display}</strong></p>"
-
-    # Add panel members to body if panel interview
-    if is_panel and validated_panel:
-        body_html += "<p><strong>Interview Panel:</strong></p><ul>"
-        for pi in validated_panel:
-            name = pi.get("name") or pi.get("email", "")
-            body_html += f"<li>{name}</li>"
-        body_html += "</ul>"
-
-    if agenda:
-        body_html += f"<p>{agenda.replace(chr(10), '<br>')}</p>"
+    # Build professional HTML body using helper
+    body_html = _build_professional_invite_body(
+        time_display=candidate_time_display,
+        role_title=role_title,
+        duration_minutes=duration_minutes,
+        panel_members=validated_panel if is_panel else None,
+        agenda=agenda,
+    )
 
     payload = _graph_event_payload(
         subject=effective_subject,
@@ -5199,6 +6578,7 @@ def _handle_create_invite(
         end_local=end_local,
         time_zone=candidate_timezone,  # Use candidate timezone for calendar event
         attendees=attendees,
+        cc_attendees=cc_attendees,  # Interviewers in CC
         is_teams=is_teams,
         location=location,
     )

@@ -335,6 +335,13 @@ class GraphClient:
         url = f"{self.cfg.base_url}/users/{self.cfg.scheduler_mailbox}/events/{event_id}"
         self._request("DELETE", url)
 
+    @with_retry(max_attempts=3, base_delay_s=1.0)
+    def get_event(self, event_id: str) -> Dict[str, Any]:
+        """Fetch a single calendar event by ID. Retries on transient errors."""
+        url = f"{self.cfg.base_url}/users/{self.cfg.scheduler_mailbox}/events/{event_id}"
+        _, body = self._request("GET", url)
+        return body or {}
+
     # ---------------- Diagnostics ----------------
     def me(self) -> Dict[str, Any]:
         """Get current user info (app-only tokens usually cannot call /me)."""
@@ -429,18 +436,23 @@ class GraphClient:
         return response_body or {"status": "sent"}
 
     @with_retry(max_attempts=3, base_delay_s=1.0)
-    def fetch_unread_messages(self, top: int = 50) -> list[Dict[str, Any]]:
+    def fetch_unread_messages(self, top: int = 50, include_read: bool = False) -> list[Dict[str, Any]]:
         """
-        Fetch unread messages from the scheduler mailbox via Graph API.
+        Fetch messages from the scheduler mailbox via Graph API.
         Returns list of message dicts with id, subject, from, receivedDateTime, bodyPreview.
+
+        Args:
+            top: Maximum number of messages to fetch
+            include_read: If True, fetches all recent messages (not just unread)
         """
         url = f"{self.cfg.base_url}/users/{self.cfg.scheduler_mailbox}/messages"
         params = {
-            "$filter": "isRead eq false",
             "$top": str(top),
             "$orderby": "receivedDateTime desc",
-            "$select": "id,subject,from,receivedDateTime,bodyPreview,body",
+            "$select": "id,subject,from,receivedDateTime,bodyPreview,body,isRead",
         }
+        if not include_read:
+            params["$filter"] = "isRead eq false"
         _, body = self._request("GET", url, params=params)
         return body.get("value", []) if body else []
 
