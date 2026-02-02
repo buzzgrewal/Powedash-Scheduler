@@ -3911,10 +3911,10 @@ def main() -> None:
                     selected_interviewers.append(interviewer_options[idx])
 
                 if len(selected_interviewers) == 1:
-                    st.info(f"📋 Will send **{selected_interviewers[0]['name']}**'s slots and CC them")
+                    st.info(f"📋 Will send **{selected_interviewers[0]['name']}**'s available slots to candidate")
                 elif len(selected_interviewers) > 1:
                     names = ", ".join([i['name'] for i in selected_interviewers])
-                    st.info(f"📋 Will send slots where **all {len(selected_interviewers)} interviewers** are available ({names})")
+                    st.info(f"📋 Will send slots where **all {len(selected_interviewers)} interviewers** are available to candidate ({names})")
                 else:
                     st.warning("Please select at least one interviewer")
 
@@ -3994,11 +3994,6 @@ def main() -> None:
                     st.session_state["candidate_email_html"] = html_body
                     st.session_state["candidate_email_plain"] = plain_body
                     st.session_state["candidate_email_generated_at"] = datetime.now().strftime("%H:%M:%S")
-                    # Store selected interviewers for CC (list of dicts with name and email)
-                    st.session_state["email_cc_interviewers"] = [
-                        {"name": i["name"], "email": i["email"]}
-                        for i in selected_interviewers if i.get("email")
-                    ]
 
                     if len(selected_interviewers) == 1:
                         interviewer_note = f" (for {selected_interviewers[0]['name']})"
@@ -4030,31 +4025,9 @@ def main() -> None:
                 else:
                     st.text_area("Email preview (Plain Text)", st.session_state["candidate_email_plain"], height=300)
 
-                # Determine CC recipients - interviewers whose slots are being sent + recruiter
-                cc_interviewers = st.session_state.get("email_cc_interviewers", [])
-
-                # Build CC list
-                cc_list = []
-                cc_display = []
-                cc_emails_added = set()
-
-                # Add all selected interviewers to CC
-                for interviewer in cc_interviewers:
-                    email = interviewer.get("email", "")
-                    name = interviewer.get("name", "")
-                    if email and email.lower() not in cc_emails_added:
-                        cc_list.append(email)
-                        cc_display.append(f"{name} (Interviewer)" if name else email)
-                        cc_emails_added.add(email.lower())
-
-                # Add recruiter if not already in CC
-                if recruiter_email and recruiter_email.lower() not in cc_emails_added:
-                    cc_list.append(recruiter_email)
-                    cc_display.append(f"{recruiter_email} (Recruiter)")
-
-                # Show recipient info before send for verification
-                cc_text = f" (CC: {', '.join(cc_display)})" if cc_display else ""
-                st.info(f"📧 Email will be sent to: **{candidate_email}**{cc_text}")
+                # Slots email goes ONLY to candidate - Hiring Manager and Recruiter
+                # will receive the calendar invite when the interview is scheduled
+                st.info(f"📧 Slots email will be sent to: **{candidate_email}** only (Interviewers, Hiring Manager & Recruiter will receive the calendar invite when scheduled)")
 
                 company = get_company_config()
                 if st.button("Send Email"):
@@ -4074,7 +4047,6 @@ def main() -> None:
                             subject=f"Interview Opportunity at {company.name}: {role_title}",
                             body=html_body,
                             to_emails=[candidate_email],
-                            cc_emails=cc_list if cc_list else None,
                             content_type="HTML",
                             plain_text_body=plain_body,
                         )
@@ -4087,7 +4059,6 @@ def main() -> None:
                             role_title=role_title or "",
                             payload={
                                 "subject": f"Interview Opportunity at {company.name}: {role_title}",
-                                "cc_interviewers": [i.get("email") for i in cc_interviewers],
                             },
                             status="success" if ok else "failed",
                             error_message="" if ok else "Graph email send failed",
