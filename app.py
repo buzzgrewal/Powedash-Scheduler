@@ -987,22 +987,58 @@ def format_slot_label(slot: Dict[str, str]) -> str:
     return base_label
 
 
-def format_slot_for_email(slot: Dict[str, str]) -> str:
+def format_slot_for_email(
+    slot: Dict[str, str],
+    source_timezone: Optional[str] = None,
+    target_timezone: Optional[str] = None
+) -> str:
     """
     Format slot in a professional, human-readable way for emails.
-    Example: "Monday, January 26, 2026 • 9:00 AM – 9:30 AM"
+    Example: "Monday, January 26, 2026 • 9:00 AM – 9:30 AM (PST)"
+
+    Args:
+        slot: Slot dict with 'date', 'start', 'end' keys
+        source_timezone: The timezone the slot times are in (e.g., interviewer's timezone)
+        target_timezone: The timezone to display times in (e.g., candidate's timezone)
     """
+    from timezone_utils import safe_zoneinfo, to_utc, from_utc
+
     try:
         date_obj = datetime.strptime(slot['date'], "%Y-%m-%d")
         start_time = datetime.strptime(slot['start'], "%H:%M")
         end_time = datetime.strptime(slot['end'], "%H:%M")
 
+        # Create full datetime objects
+        start_dt = datetime.combine(date_obj.date(), start_time.time())
+        end_dt = datetime.combine(date_obj.date(), end_time.time())
+
+        # If timezones provided, convert from source to target
+        if source_timezone and target_timezone and source_timezone != target_timezone:
+            source_zi, _ = safe_zoneinfo(source_timezone, fallback="UTC")
+
+            # Make timezone-aware in source timezone
+            start_dt = start_dt.replace(tzinfo=source_zi)
+            end_dt = end_dt.replace(tzinfo=source_zi)
+
+            # Convert to target timezone
+            start_dt = from_utc(to_utc(start_dt), target_timezone)
+            end_dt = from_utc(to_utc(end_dt), target_timezone)
+
+            # Get the date in target timezone (might be different day)
+            date_obj = start_dt
+
         # Format: "Monday, January 26, 2026"
         date_str = date_obj.strftime("%A, %B %d, %Y")
 
         # Format time in 12-hour with AM/PM: "9:00 AM"
-        start_str = start_time.strftime("%I:%M %p").lstrip("0")
-        end_str = end_time.strftime("%I:%M %p").lstrip("0")
+        start_str = start_dt.strftime("%I:%M %p").lstrip("0")
+        end_str = end_dt.strftime("%I:%M %p").lstrip("0")
+
+        # Add timezone abbreviation if we did a conversion
+        if target_timezone and source_timezone and source_timezone != target_timezone:
+            tz_abbrev = start_dt.strftime("%Z") if hasattr(start_dt, 'tzinfo') and start_dt.tzinfo else ""
+            if tz_abbrev:
+                return f"{date_str} • {start_str} – {end_str} ({tz_abbrev})"
 
         return f"{date_str} • {start_str} – {end_str}"
     except (ValueError, KeyError):
@@ -1601,12 +1637,18 @@ def build_branded_email_html(
     slots: List[Dict[str, str]],
     company: CompanyConfig,
     custom_message: Optional[str] = None,
+    source_timezone: Optional[str] = None,
+    target_timezone: Optional[str] = None,
 ) -> str:
     """
     Build professional HTML email with company branding.
 
     Uses inline CSS only for email client compatibility.
     Max width 600px, table-based layout.
+
+    Args:
+        source_timezone: The timezone the slot times are stored in
+        target_timezone: The timezone to display times in (candidate's timezone)
     """
     # Logo section or company name header
     logo_html = _build_logo_html(company)
@@ -1631,7 +1673,7 @@ def build_branded_email_html(
     # Build slot list HTML with numbered options - using better formatting
     slot_items = ""
     for idx, slot in enumerate(slots, start=1):
-        formatted_slot = format_slot_for_email(slot)
+        formatted_slot = format_slot_for_email(slot, source_timezone, target_timezone)
         slot_items += f'''
         <tr>
             <td style="padding: 14px 16px; border-left: 4px solid {company.primary_color};
@@ -1837,10 +1879,12 @@ def build_branded_email_plain(
     role_title: str,
     slots: List[Dict[str, str]],
     company: CompanyConfig,
+    source_timezone: Optional[str] = None,
+    target_timezone: Optional[str] = None,
 ) -> str:
     """Plain text version of branded email for fallback."""
     greeting = f"Dear {candidate_name}," if candidate_name and candidate_name.strip() else "Hello,"
-    slot_lines = "\n".join([f"  {idx}. {format_slot_for_email(s)}" for idx, s in enumerate(slots, start=1)]) if slots else "  (No slots available)"
+    slot_lines = "\n".join([f"  {idx}. {format_slot_for_email(s, source_timezone, target_timezone)}" for idx, s in enumerate(slots, start=1)]) if slots else "  (No slots available)"
 
     footer_parts = [company.signature_name]
     if company.website:
@@ -3579,6 +3623,9 @@ def main() -> None:
                 else:
                     filtered_slots = st.session_state["slots"]
 
+                # Store filtered slots for email generation to use
+                st.session_state["filtered_slots_for_email"] = filtered_slots
+
                 if not filtered_slots:
                     st.warning("No slots match the current filter. Try relaxing the availability requirement.")
                     selected_slot = None
@@ -3931,38 +3978,13 @@ def main() -> None:
             if st.button("Generate Candidate Scheduling Email"):
                 company = get_company_config()
 
-                # Determine which slots to use based on selected interviewers
-                if not selected_interviewers:
-                    st.error("Please select at least one interviewer.")
-                    source_slots = []
-                elif len(selected_interviewers) == 1:
-                    # Single interviewer - use their slots directly
-                    source_slots = selected_interviewers[0].get("slots", [])
-                else:
-                    # Multiple interviewers - find intersection of their slots
-                    # A slot is available if all selected interviewers have it
-                    def slot_key(s):
-                        return (s["date"], s["start"], s["end"])
-
-                    # Start with first interviewer's slots
-                    common_keys = set(slot_key(s) for s in selected_interviewers[0].get("slots", []))
-
-                    # Intersect with each other interviewer's slots
-                    for interviewer in selected_interviewers[1:]:
-                        interviewer_keys = set(slot_key(s) for s in interviewer.get("slots", []))
-                        common_keys = common_keys.intersection(interviewer_keys)
-
-                    # Get the actual slot objects for common keys
-                    source_slots = [
-                        s for s in selected_interviewers[0].get("slots", [])
-                        if slot_key(s) in common_keys
-                    ]
-
-                    if not source_slots:
-                        st.warning(f"No common slots found where all {len(selected_interviewers)} interviewers are available.")
+                # Use the current filtered/edited slots from session state
+                # This ensures edits/deletions made in the UI are reflected in the email
+                # and respects the current availability filter mode
+                source_slots = st.session_state.get("filtered_slots_for_email", st.session_state.get("slots", []))
 
                 if not source_slots:
-                    st.error("No slots available for the selected interviewer. Please add availability first.")
+                    st.error("No slots available. Please add availability first.")
                 else:
                     # Split slots by duration for email (ensures discrete meeting slots)
                     email_slots = []
@@ -3984,12 +4006,16 @@ def main() -> None:
                         role_title=role_title or "Position",
                         slots=email_slots,
                         company=company,
+                        source_timezone=tz_name,
+                        target_timezone=candidate_timezone,
                     )
                     plain_body = build_branded_email_plain(
                         candidate_name=candidate_name,
                         role_title=role_title or "Position",
                         slots=email_slots,
                         company=company,
+                        source_timezone=tz_name,
+                        target_timezone=candidate_timezone,
                     )
                     st.session_state["candidate_email_html"] = html_body
                     st.session_state["candidate_email_plain"] = plain_body
