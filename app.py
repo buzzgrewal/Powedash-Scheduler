@@ -3390,12 +3390,11 @@ def main() -> None:
     audit = AuditLog(get_audit_log_path())
     _render_branded_header(company)
 
-    tab_new, tab_inbox, tab_invites, tab_audit, tab_diag = st.tabs([
+    tab_new, tab_inbox, tab_invites, tab_audit = st.tabs([
         "📝 New Request",
         "📥 Inbox",
         "📅 Interviews",
         "📜 Audit Log",
-        "🔧 Diagnostics",
     ])
 
     # ========= TAB: New Scheduling Request =========
@@ -4237,11 +4236,17 @@ def main() -> None:
                 st.rerun()
 
         # Filter options
-        col_filter1, col_filter2 = st.columns(2)
+        col_filter1, col_filter2, col_filter3 = st.columns(3)
         with col_filter1:
             hide_bounces = st.checkbox("Hide bounce/undeliverable messages", value=True)
         with col_filter2:
             include_read = st.checkbox("Include already-read messages", value=False)
+        with col_filter3:
+            auto_send_invites = st.checkbox("Auto-send invites when slot detected", value=False, help="Automatically send calendar invites when a slot choice is detected from candidate replies")
+
+        # Initialize session state for tracking auto-processed emails
+        if "auto_processed_emails" not in st.session_state:
+            st.session_state.auto_processed_emails = set()
 
         # Try IMAP first (Gmail), fall back to Graph API (Office 365)
         emails, error, is_configured = fetch_emails_imap(include_read=include_read)
@@ -4286,8 +4291,110 @@ def main() -> None:
             else:
                 st.write(f"Found {len(emails)} email(s).")
 
+            # Helper function to send invite for a detected slot
+            def _send_invite_for_email(email_data: Dict[str, Any], detected_slot: Dict[str, str]) -> bool:
+                """Send calendar invite for a detected slot choice. Returns True on success."""
+                cand_email = email_data.get("from", "")
+
+                # Get current form values from session state
+                hm_email = st.session_state.get("hiring_manager_email", "")
+                hm_name = st.session_state.get("hiring_manager_name", "")
+                rec_email = st.session_state.get("recruiter_email", "")
+                rec_name = st.session_state.get("recruiter_name", "")
+                role_title = st.session_state.get("role_title", "")
+                duration = int(st.session_state.get("duration_minutes", 60))
+                tz_name = st.session_state.get("tz_name", "UTC")
+                candidate_tz = st.session_state.get("candidate_timezone", tz_name)
+                is_teams = st.session_state.get("is_teams", True)
+                subject = st.session_state.get("subject", "")
+                agenda = st.session_state.get("agenda", "")
+                location = st.session_state.get("location", "")
+                include_recruiter = st.session_state.get("include_recruiter", False)
+                panel_interviewers = st.session_state.get("panel_interviewers", [])
+
+                # Validate we have minimum required info
+                if not hm_email and not panel_interviewers:
+                    st.error(f"Cannot auto-send to {cand_email}: Please set hiring manager email or panel interviewers in the New Scheduling Request tab first.")
+                    return False
+
+                # Parse candidate name from email if possible
+                candidate_name = _ensure_candidate_name("", cand_email)
+
+                # Create the invite
+                result = _create_individual_invite(
+                    audit=audit,
+                    selected_slot=detected_slot,
+                    tz_name=tz_name,
+                    candidate_timezone=candidate_tz,
+                    duration_minutes=duration,
+                    role_title=role_title,
+                    subject=subject,
+                    agenda=agenda,
+                    location=location,
+                    is_teams=is_teams,
+                    candidate=(cand_email, candidate_name),
+                    hiring_manager=(hm_email, hm_name),
+                    recruiter=(rec_email, rec_name),
+                    include_recruiter=include_recruiter,
+                    panel_interviewers=[
+                        {"name": p.get("name", ""), "email": p.get("email", "")}
+                        for p in panel_interviewers if p.get("email")
+                    ] if panel_interviewers else None,
+                )
+
+                if result.success:
+                    # Mark email as read after successful invite
+                    email_id = email_data.get("id", "")
+                    if email_id:
+                        mark_email_read_imap(email_id)
+                    return True
+                else:
+                    st.error(f"Failed to send invite to {cand_email}: {result.error}")
+                    return False
+
+            # AUTO-SEND PROCESSING: Process emails with detected slots before rendering UI
+            if auto_send_invites and emails:
+                auto_send_results = []
+                for email_item in emails:
+                    email_id = email_item.get("id", "")
+                    # Skip if already processed or already read
+                    if email_id in st.session_state.auto_processed_emails:
+                        continue
+                    if email_item.get("is_read"):
+                        continue
+
+                    # Check for slot choice
+                    full_body = email_item.get("full_body", email_item.get("body", ""))
+                    detected_choice = detect_slot_choice_from_text(full_body, st.session_state.get("slots", []))
+
+                    if detected_choice:
+                        cand_email = email_item.get("from", "")
+                        slot_display = f"{detected_choice.get('date')} {detected_choice.get('start')}-{detected_choice.get('end')}"
+
+                        # Try to send the invite
+                        with st.spinner(f"Auto-sending invite to {cand_email} for slot {slot_display}..."):
+                            success = _send_invite_for_email(email_item, detected_choice)
+
+                        if success:
+                            auto_send_results.append((cand_email, slot_display, True))
+                            # Mark as processed to avoid duplicate sends
+                            st.session_state.auto_processed_emails.add(email_id)
+                        else:
+                            auto_send_results.append((cand_email, slot_display, False))
+
+                # Show auto-send results
+                if auto_send_results:
+                    for cand, slot, success in auto_send_results:
+                        if success:
+                            st.success(f"Auto-sent invite to {cand} for slot {slot}")
+                        # Errors already shown by _send_invite_for_email
+
+            # Render email list UI
             for i, e in enumerate(emails, start=1):
-                read_status = "[READ]" if e.get("is_read") else "[NEW]"
+                email_id = e.get("id", "")
+                was_auto_processed = email_id in st.session_state.auto_processed_emails
+                read_status = "[SENT]" if was_auto_processed else ("[READ]" if e.get("is_read") else "[NEW]")
+
                 with st.expander(f"{i}. {read_status} {e['subject'] or '(no subject)'} — {e['from']}"):
                     st.write(e.get("date", ""))
                     preview_body = e.get("body", "")
@@ -4307,78 +4414,31 @@ def main() -> None:
                     if choice:
                         st.success(f"Detected slot choice: {choice.get('date')} {choice.get('start')}-{choice.get('end')}")
 
-                        # Show confirm button to send calendar invite
-                        col1, col2 = st.columns([2, 1])
-                        with col1:
-                            st.info(f"Ready to send invite to: {candidate_email}")
-                        with col2:
-                            if st.button(f"Confirm & Send Invite", key=f"confirm_slot_{i}"):
-                                # Get current form values from session state
-                                hm_email = st.session_state.get("hiring_manager_email", "")
-                                hm_name = st.session_state.get("hiring_manager_name", "")
-                                rec_email = st.session_state.get("recruiter_email", "")
-                                rec_name = st.session_state.get("recruiter_name", "")
-                                role_title = st.session_state.get("role_title", "")
-                                duration = int(st.session_state.get("duration_minutes", 60))
-                                tz_name = st.session_state.get("tz_name", "UTC")
-                                candidate_tz = st.session_state.get("candidate_timezone", tz_name)
-                                is_teams = st.session_state.get("is_teams", True)
-                                subject = st.session_state.get("subject", "")
-                                agenda = st.session_state.get("agenda", "")
-                                location = st.session_state.get("location", "")
-                                include_recruiter = st.session_state.get("include_recruiter", False)
-                                panel_interviewers = st.session_state.get("panel_interviewers", [])
-
-                                # Validate we have minimum required info
-                                if not hm_email and not panel_interviewers:
-                                    st.error("Please set hiring manager email or panel interviewers in the New Scheduling Request tab first.")
-                                else:
-                                    # Parse candidate name from email if possible
-                                    candidate_name = _ensure_candidate_name("", candidate_email)
-
-                                    # Create the invite
-                                    with st.spinner("Sending calendar invite..."):
-                                        result = _create_individual_invite(
-                                            audit=audit,
-                                            selected_slot=choice,
-                                            tz_name=tz_name,
-                                            candidate_timezone=candidate_tz,
-                                            duration_minutes=duration,
-                                            role_title=role_title,
-                                            subject=subject,
-                                            agenda=agenda,
-                                            location=location,
-                                            is_teams=is_teams,
-                                            candidate=(candidate_email, candidate_name),
-                                            hiring_manager=(hm_email, hm_name),
-                                            recruiter=(rec_email, rec_name),
-                                            include_recruiter=include_recruiter,
-                                            panel_interviewers=[
-                                                {"name": p.get("name", ""), "email": p.get("email", "")}
-                                                for p in panel_interviewers if p.get("email")
-                                            ] if panel_interviewers else None,
-                                        )
-
-                                    if result.success:
+                        # Check if already auto-processed
+                        if was_auto_processed:
+                            st.info(f"Invite already auto-sent to: {candidate_email}")
+                        elif auto_send_invites:
+                            # Already processed above, but email might be read or had an error
+                            if e.get("is_read"):
+                                st.info(f"Email already read - skipped auto-send. Use manual button if needed.")
+                            # Show manual button as fallback
+                            if st.button(f"Re-send Invite", key=f"resend_slot_{i}"):
+                                with st.spinner("Sending calendar invite..."):
+                                    if _send_invite_for_email(e, choice):
                                         st.success(f"Calendar invite sent to {candidate_email}!")
-                                        if result.recipients:
-                                            st.caption(f"All recipients: {', '.join(result.recipients)}")
-                                        # Debug: show if Teams was requested
-                                        st.caption(f"Teams meeting requested: {is_teams}")
-                                        if result.teams_url:
-                                            st.link_button("Open Teams Link", result.teams_url)
-                                        else:
-                                            st.caption("No Teams URL in result")
-                                        if result.warnings:
-                                            for w in result.warnings:
-                                                st.warning(w)
-                                        # Mark email as read after successful invite
-                                        email_id = e.get("id", "")
-                                        if email_id:
-                                            if mark_email_read_imap(email_id):
-                                                st.caption("Email marked as read")
-                                    else:
-                                        st.error(f"Failed to send invite: {result.error}")
+                                        st.session_state.auto_processed_emails.add(email_id)
+                                        st.rerun()
+                        else:
+                            # Manual mode - show confirm button
+                            col1, col2 = st.columns([2, 1])
+                            with col1:
+                                st.info(f"Ready to send invite to: {candidate_email}")
+                            with col2:
+                                if st.button(f"Confirm & Send Invite", key=f"confirm_slot_{i}"):
+                                    with st.spinner("Sending calendar invite..."):
+                                        if _send_invite_for_email(e, choice):
+                                            st.success(f"Calendar invite sent to {candidate_email}!")
+                                            st.rerun()
                     else:
                         st.info("No slot choice detected from this email.")
 
@@ -5064,132 +5124,6 @@ def main() -> None:
                 else:
                     _render_audit_raw(filtered_entries)
 
-    # ========= TAB: Graph Diagnostics =========
-    with tab_diag:
-        st.subheader("Graph Diagnostics")
-        st.caption("Use this to verify Graph auth and mailbox access. No secrets are displayed.")
-
-        cfg = get_graph_config()
-        if not cfg:
-            st.warning("Graph is not configured. Add graph_tenant_id, graph_client_id, graph_client_secret, graph_scheduler_mailbox in Streamlit secrets.")
-        else:
-            st.code(f"Scheduler mailbox: {cfg.scheduler_mailbox}")
-            client = GraphClient(cfg)
-
-            if st.button("Test token acquisition"):
-                try:
-                    token = client.get_token(force_refresh=True)
-                    st.success(f"Token OK (length={len(token)})")
-                    audit.log("graph_token_ok", payload={"length": len(token)}, status="success")
-                except Exception as e:
-                    st.error(str(e))
-                    audit.log("graph_token_failed", payload={"error": str(e)}, status="failed", error_message=str(e))
-
-            if st.button("Test calendar read (top 5)"):
-                try:
-                    data = client.test_calendar_read(top=5)
-                    st.success("Calendar read OK.")
-                    st.json(data)
-                    audit.log("graph_calendar_read_ok", payload={"top": 5}, status="success")
-                except GraphAPIError as e:
-                    st.error(f"{e} — details below")
-                    st.json(e.response_json)
-                    audit.log("graph_calendar_read_failed", payload=e.response_json, status="failed", error_message=str(e))
-
-            st.markdown("----")
-            st.markdown("#### Test Teams Meeting Creation")
-            st.caption("Test if the Graph API can create events with Teams meetings")
-
-            if st.button("Test Teams Meeting"):
-                try:
-                    import time as time_module
-                    dt = datetime.now().replace(second=0, microsecond=0) + timedelta(hours=2)
-                    tz = get_default_timezone()
-                    start_dt = {"dateTime": dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz}
-                    end_dt = {"dateTime": (dt + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz}
-
-                    payload = {
-                        "subject": "PowerDash Teams Test (will be deleted)",
-                        "body": {"contentType": "HTML", "content": "Test event to verify Teams meeting creation."},
-                        "start": start_dt,
-                        "end": end_dt,
-                        "isOnlineMeeting": True,
-                        "onlineMeetingProvider": "teamsForBusiness",
-                        "location": {"displayName": "Microsoft Teams"},
-                        "attendees": [],
-                    }
-
-                    st.write("Creating test event with Teams meeting...")
-                    created = client.create_event(payload)
-                    event_id = created.get("id", "")
-
-                    st.write("**Initial response:**")
-                    st.json({
-                        "id": event_id,
-                        "isOnlineMeeting": created.get("isOnlineMeeting"),
-                        "onlineMeetingProvider": created.get("onlineMeetingProvider"),
-                        "onlineMeeting": created.get("onlineMeeting"),
-                        "webLink": created.get("webLink"),
-                    })
-
-                    teams_url = ""
-                    if created.get("onlineMeeting"):
-                        teams_url = created.get("onlineMeeting", {}).get("joinUrl", "")
-
-                    if not teams_url:
-                        st.write("No Teams URL in initial response. Waiting 3 seconds and fetching again...")
-                        time_module.sleep(3)
-                        refreshed = client.get_event(event_id)
-                        st.write("**Refreshed response:**")
-                        st.json({
-                            "id": refreshed.get("id"),
-                            "isOnlineMeeting": refreshed.get("isOnlineMeeting"),
-                            "onlineMeetingProvider": refreshed.get("onlineMeetingProvider"),
-                            "onlineMeeting": refreshed.get("onlineMeeting"),
-                            "webLink": refreshed.get("webLink"),
-                        })
-                        if refreshed.get("onlineMeeting"):
-                            teams_url = refreshed.get("onlineMeeting", {}).get("joinUrl", "")
-
-                    if teams_url:
-                        st.success(f"Teams URL found: {teams_url}")
-                    else:
-                        st.warning("No Teams URL returned. This may indicate a permissions or licensing issue.")
-
-                    # Clean up - delete the test event
-                    st.write("Cleaning up test event...")
-                    client.delete_event(event_id)
-                    st.success("Test event deleted")
-
-                except GraphAPIError as e:
-                    st.error(f"Graph API Error: {e}")
-                    st.json(e.response_json)
-                except Exception as e:
-                    st.error(f"Error: {e}")
-
-            st.markdown("----")
-            st.markdown("#### Dummy event (optional)")
-            dry_run = st.checkbox("Dry run (do not create)", value=True)
-            tz_name = st.selectbox("Timezone", options=_common_timezones(), index=_common_timezones().index(get_default_timezone()) if get_default_timezone() in _common_timezones() else 0)
-            dt = datetime.now().replace(second=0, microsecond=0) + timedelta(hours=2)
-            date = st.date_input("Date", value=dt.date())
-            time = st.time_input("Time", value=dt.time())
-            start_local = datetime.combine(date, time).replace(tzinfo=_zoneinfo(tz_name))
-            end_local = start_local + timedelta(minutes=30)
-
-            if st.button("Create dummy event"):
-                try:
-                    start_dt = {"dateTime": start_local.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz_name}
-                    end_dt = {"dateTime": end_local.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": tz_name}
-                    out = client.create_dummy_event("PowerDash Diagnostics", start_dt, end_dt, dry_run=dry_run)
-                    st.success("OK")
-                    st.json(out)
-                    audit.log("graph_dummy_event_ok", payload={"dry_run": dry_run}, status="success")
-                except GraphAPIError as e:
-                    st.error(f"{e}")
-                    st.json(e.response_json)
-                    audit.log("graph_dummy_event_failed", payload=e.response_json, status="failed", error_message=str(e))
-
     # Render footer if enabled
     if layout.show_footer:
         _render_footer()
@@ -5505,7 +5439,7 @@ def _render_batch_results(results: List[SchedulingResult]) -> None:
                         st.warning(w, icon="warning")
 
                 if r.teams_url:
-                    st.link_button("Open Teams Link", r.teams_url, key=f"teams_{r.event_id}_{r.candidate_email}")
+                    st.link_button("Open Teams Link", r.teams_url)
 
     # Failure details
     if failed:
