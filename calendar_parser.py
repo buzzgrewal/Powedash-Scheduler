@@ -314,7 +314,7 @@ class CalendarParser:
         """
         self.client = openai_client
         self.config = config or ParserConfig()
-        self.model = "gpt-5.2"  # Default, can be overridden
+        self.model = "gpt-4o-mini"  # Default, can be overridden
 
     def set_model(self, model: str) -> None:
         """Set the OpenAI model to use."""

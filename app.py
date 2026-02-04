@@ -579,7 +579,7 @@ def parse_slots_from_image(image: Image.Image, interviewer_timezone: Optional[st
 
     # Create parser and set model
     parser = CalendarParser(client, config)
-    parser.set_model(get_secret("openai_model", "gpt-5.2"))
+    parser.set_model(get_secret("openai_model", "gpt-4o-mini"))
 
     try:
         # Parse with format detection
@@ -848,7 +848,7 @@ TEXT TO PARSE:
 
     try:
         resp = client.chat.completions.create(
-            model=get_secret("openai_model", "gpt-5.2"),
+            model=get_secret("openai_model", "gpt-4o-mini"),
             temperature=0,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that returns strict JSON. Never include markdown formatting."},
@@ -3844,7 +3844,7 @@ def main() -> None:
             agenda = st.text_area("Description/agenda", value="Interview discussion.", key="agenda")
             location = st.text_input("Location (non-Teams)", value="", key="location")
 
-            include_recruiter = st.checkbox("Include recruiter as attendee", value=False, key="include_recruiter")
+            include_recruiter = st.checkbox("Include recruiter as attendee", value=True, key="include_recruiter")
 
             st.markdown("----")
             st.markdown("#### Email Branding")
@@ -4106,77 +4106,77 @@ def main() -> None:
             has_valid_candidates = len(valid_candidates) > 0 and (proceed_with_valid or not invalid_count)
             create_disabled = not (selected_slot and has_interviewers and has_valid_candidates)
 
-            # Button text reflects number of candidates
-            button_text = "Create & Send Interview Invite"
-            if len(valid_candidates) > 1:
-                button_text = f"Create & Send {len(valid_candidates)} Interview Invite(s)"
+            # # Button text reflects number of candidates
+            # button_text = "Create & Send Interview Invite"
+            # if len(valid_candidates) > 1:
+            #     button_text = f"Create & Send {len(valid_candidates)} Interview Invite(s)"
+            #
+            # # Validate Before Send button
+            # col_validate, col_send = st.columns([1, 2])
+            # with col_validate:
+            #     if st.button("Validate Before Send", disabled=create_disabled, help="Preview who will receive invites"):
+            #         report = _validate_invite_flow(
+            #             selected_slot=selected_slot,
+            #             tz_name=tz_name,
+            #             candidate_timezone=candidate_timezone,
+            #             duration_minutes=int(st.session_state["duration_minutes"]),
+            #             candidates=valid_candidates,
+            #             hiring_manager=(hiring_manager_email, hiring_manager_name),
+            #             recruiter=(recruiter_email, recruiter_name),
+            #             include_recruiter=include_recruiter,
+            #             panel_interviewers=panel_interviewers_for_invite if panel_interviewers_for_invite else None,
+            #             is_teams=is_teams,
+            #             role_title=role_title,
+            #         )
+            #
+            #         # Display validation report
+            #         if report.is_valid:
+            #             st.success(report.summary)
+            #         else:
+            #             st.error(report.summary)
+            #
+            #         # Show intended recipients
+            #         if report.intended_recipients:
+            #             st.markdown("**Invites will be sent to:**")
+            #             for recipient in report.intended_recipients:
+            #                 st.markdown(f"- {recipient}")
+            #
+            #         # Show errors
+            #         if report.errors:
+            #             st.markdown("**Errors (must fix):**")
+            #             for err in report.errors:
+            #                 st.error(err)
+            #
+            #         # Show warnings
+            #         if report.warnings:
+            #             st.markdown("**Warnings:**")
+            #             for w in report.warnings:
+            #                 st.warning(w)
 
-            # Validate Before Send button
-            col_validate, col_send = st.columns([1, 2])
-            with col_validate:
-                if st.button("Validate Before Send", disabled=create_disabled, help="Preview who will receive invites"):
-                    report = _validate_invite_flow(
-                        selected_slot=selected_slot,
-                        tz_name=tz_name,
-                        candidate_timezone=candidate_timezone,
-                        duration_minutes=int(st.session_state["duration_minutes"]),
-                        candidates=valid_candidates,
-                        hiring_manager=(hiring_manager_email, hiring_manager_name),
-                        recruiter=(recruiter_email, recruiter_name),
-                        include_recruiter=include_recruiter,
-                        panel_interviewers=panel_interviewers_for_invite if panel_interviewers_for_invite else None,
-                        is_teams=is_teams,
-                        role_title=role_title,
-                    )
-
-                    # Display validation report
-                    if report.is_valid:
-                        st.success(report.summary)
-                    else:
-                        st.error(report.summary)
-
-                    # Show intended recipients
-                    if report.intended_recipients:
-                        st.markdown("**Invites will be sent to:**")
-                        for recipient in report.intended_recipients:
-                            st.markdown(f"- {recipient}")
-
-                    # Show errors
-                    if report.errors:
-                        st.markdown("**Errors (must fix):**")
-                        for err in report.errors:
-                            st.error(err)
-
-                    # Show warnings
-                    if report.warnings:
-                        st.markdown("**Warnings:**")
-                        for w in report.warnings:
-                            st.warning(w)
-
-            with col_send:
-                if st.button(button_text, disabled=create_disabled):
-                    with st.spinner(f"Scheduling {len(valid_candidates)} interview(s)..."):
-                        results = _handle_multi_candidate_invite(
-                            audit=audit,
-                            selected_slot=selected_slot,
-                            tz_name=tz_name,
-                            candidate_timezone=candidate_timezone,
-                            duration_minutes=int(st.session_state["duration_minutes"]),
-                            role_title=role_title,
-                            subject=subject,
-                            agenda=agenda,
-                            location=location,
-                            is_teams=is_teams,
-                            candidates=valid_candidates,
-                            hiring_manager=(hiring_manager_email, hiring_manager_name),
-                            recruiter=(recruiter_email, recruiter_name),
-                            include_recruiter=include_recruiter,
-                            panel_interviewers=panel_interviewers_for_invite if panel_interviewers_for_invite else None,
-                            scheduling_mode=scheduling_mode,
-                        )
-
-                    # Display batch results
-                    _render_batch_results(results)
+            # with col_send:
+            #     if st.button(button_text, disabled=create_disabled):
+            #         with st.spinner(f"Scheduling {len(valid_candidates)} interview(s)..."):
+            #             results = _handle_multi_candidate_invite(
+            #                 audit=audit,
+            #                 selected_slot=selected_slot,
+            #                 tz_name=tz_name,
+            #                 candidate_timezone=candidate_timezone,
+            #                 duration_minutes=int(st.session_state["duration_minutes"]),
+            #                 role_title=role_title,
+            #                 subject=subject,
+            #                 agenda=agenda,
+            #                 location=location,
+            #                 is_teams=is_teams,
+            #                 candidates=valid_candidates,
+            #                 hiring_manager=(hiring_manager_email, hiring_manager_name),
+            #                 recruiter=(recruiter_email, recruiter_name),
+            #                 include_recruiter=include_recruiter,
+            #                 panel_interviewers=panel_interviewers_for_invite if panel_interviewers_for_invite else None,
+            #                 scheduling_mode=scheduling_mode,
+            #             )
+            #
+            #         # Display batch results
+            #         _render_batch_results(results)
 
             # ICS fallback download button (available after generation)
             if st.session_state.get("last_invite_ics_bytes"):
@@ -4242,7 +4242,7 @@ def main() -> None:
         with col_filter2:
             include_read = st.checkbox("Include already-read messages", value=False)
         with col_filter3:
-            auto_send_invites = st.checkbox("Auto-send invites when slot detected", value=False, help="Automatically send calendar invites when a slot choice is detected from candidate replies")
+            auto_send_invites = st.checkbox("Auto-send invites when slot detected", value=True, help="Automatically send calendar invites when a slot choice is detected from candidate replies")
 
         # Initialize session state for tracking auto-processed emails
         if "auto_processed_emails" not in st.session_state:
@@ -4296,11 +4296,11 @@ def main() -> None:
                 """Send calendar invite for a detected slot choice. Returns True on success."""
                 cand_email = email_data.get("from", "")
 
-                # Get current form values from session state
-                hm_email = st.session_state.get("hiring_manager_email", "")
-                hm_name = st.session_state.get("hiring_manager_name", "")
-                rec_email = st.session_state.get("recruiter_email", "")
-                rec_name = st.session_state.get("recruiter_name", "")
+                # Get current form values from session state (keys match form input keys)
+                hm_email = st.session_state.get("hm_email", "")
+                hm_name = st.session_state.get("hm_name", "")
+                rec_email = st.session_state.get("rec_email", "")
+                rec_name = st.session_state.get("rec_name", "")
                 role_title = st.session_state.get("role_title", "")
                 duration = int(st.session_state.get("duration_minutes", 60))
                 tz_name = st.session_state.get("tz_name", "UTC")
@@ -4309,7 +4309,7 @@ def main() -> None:
                 subject = st.session_state.get("subject", "")
                 agenda = st.session_state.get("agenda", "")
                 location = st.session_state.get("location", "")
-                include_recruiter = st.session_state.get("include_recruiter", False)
+                include_recruiter = st.session_state.get("include_recruiter", True)
                 panel_interviewers = st.session_state.get("panel_interviewers", [])
 
                 # Validate we have minimum required info
@@ -5974,6 +5974,42 @@ def _create_individual_invite(
             status="success",
         )
 
+        # Send meeting invitation email explicitly (Graph app-only auth doesn't auto-send invites)
+        all_recipient_emails = [a[0] for a in attendees]
+        cc_recipient_emails = [a[0] for a in cc_attendees] if cc_attendees else []
+        try:
+            import base64
+            client.send_mail(
+                subject=effective_subject,
+                body=body_html,
+                to_recipients=all_recipient_emails,
+                cc_recipients=cc_recipient_emails if cc_recipient_emails else None,
+                content_type="HTML",
+                attachment={
+                    "name": "invite.ics",
+                    "contentBytes": base64.b64encode(ics_bytes).decode("utf-8"),
+                    "contentType": "text/calendar",
+                },
+            )
+            log_structured(
+                LogLevel.INFO,
+                f"Sent meeting invitation email to {len(all_recipient_emails)} recipients",
+                action="send_invite_email",
+                details={
+                    "to": all_recipient_emails,
+                    "cc": cc_recipient_emails,
+                    "subject": effective_subject,
+                },
+            )
+        except Exception as mail_err:
+            log_structured(
+                LogLevel.WARNING,
+                f"Failed to send invitation email: {mail_err}",
+                action="send_invite_email_failed",
+                details={"error": str(mail_err)},
+            )
+            warnings.append(f"Calendar event created but email send failed: {mail_err}")
+
         return SchedulingResult(
             candidate_email=candidate_email,
             candidate_name=candidate_name,
@@ -6301,6 +6337,42 @@ def _create_group_invite(
             payload={"candidates_count": len(valid_candidates)},
             status="success",
         )
+
+        # Send meeting invitation email explicitly (Graph app-only auth doesn't auto-send invites)
+        all_recipient_emails = [a[0] for a in attendees]
+        cc_recipient_emails = [a[0] for a in cc_attendees] if cc_attendees else []
+        try:
+            import base64
+            client.send_mail(
+                subject=effective_subject,
+                body=body_html,
+                to_recipients=all_recipient_emails,
+                cc_recipients=cc_recipient_emails if cc_recipient_emails else None,
+                content_type="HTML",
+                attachment={
+                    "name": "invite.ics",
+                    "contentBytes": base64.b64encode(ics_bytes).decode("utf-8"),
+                    "contentType": "text/calendar",
+                },
+            )
+            log_structured(
+                LogLevel.INFO,
+                f"Sent group meeting invitation email to {len(all_recipient_emails)} recipients",
+                action="send_group_invite_email",
+                details={
+                    "to": all_recipient_emails,
+                    "cc": cc_recipient_emails,
+                    "subject": effective_subject,
+                },
+            )
+        except Exception as mail_err:
+            log_structured(
+                LogLevel.WARNING,
+                f"Failed to send group invitation email: {mail_err}",
+                action="send_group_invite_email_failed",
+                details={"error": str(mail_err)},
+            )
+            warnings.append(f"Calendar event created but email send failed: {mail_err}")
 
         return SchedulingResult(
             candidate_email=", ".join(c.email for c in valid_candidates),
