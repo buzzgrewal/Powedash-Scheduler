@@ -579,7 +579,7 @@ def parse_slots_from_image(image: Image.Image, interviewer_timezone: Optional[st
 
     # Create parser and set model
     parser = CalendarParser(client, config)
-    parser.set_model(get_secret("openai_model", "gpt-4o-mini"))
+    parser.set_model(get_secret("openai_model", "gpt-5.2"))
 
     try:
         # Parse with format detection
@@ -848,7 +848,7 @@ TEXT TO PARSE:
 
     try:
         resp = client.chat.completions.create(
-            model=get_secret("openai_model", "gpt-4o-mini"),
+            model=get_secret("openai_model", "gpt-5.2"),
             temperature=0,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that returns strict JSON. Never include markdown formatting."},
