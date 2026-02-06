@@ -798,6 +798,91 @@ def split_slot_by_duration(slot: Dict[str, str], duration_minutes: int) -> List[
     return result
 
 
+def filter_out_scheduled_slots(
+    slots: List[Dict[str, str]],
+    scheduled_interviews: List[Dict[str, Any]],
+    source_timezone: str = "UTC",
+) -> List[Dict[str, str]]:
+    """
+    Filter out slots that overlap with already-scheduled interviews.
+
+    Args:
+        slots: List of available slots ({"date": "YYYY-MM-DD", "start": "HH:MM", "end": "HH:MM"})
+        scheduled_interviews: List of interview dicts with start_utc and end_utc fields
+        source_timezone: Timezone of the slots (for converting to UTC for comparison)
+
+    Returns:
+        Filtered list of slots that don't conflict with scheduled interviews
+    """
+    from datetime import datetime
+    import pytz
+
+    if not slots or not scheduled_interviews:
+        return slots
+
+    try:
+        source_tz = pytz.timezone(source_timezone)
+    except Exception:
+        source_tz = pytz.UTC
+
+    # Parse scheduled interview times (stored in UTC)
+    scheduled_ranges = []
+    for interview in scheduled_interviews:
+        try:
+            start_utc = interview.get("start_utc", "")
+            end_utc = interview.get("end_utc", "")
+            if start_utc and end_utc:
+                # Parse UTC times - handle both formats
+                for fmt in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"]:
+                    try:
+                        start_dt = datetime.strptime(start_utc, fmt).replace(tzinfo=pytz.UTC)
+                        end_dt = datetime.strptime(end_utc, fmt).replace(tzinfo=pytz.UTC)
+                        scheduled_ranges.append((start_dt, end_dt))
+                        break
+                    except ValueError:
+                        continue
+        except Exception:
+            continue
+
+    if not scheduled_ranges:
+        return slots
+
+    # Filter slots
+    filtered_slots = []
+    for slot in slots:
+        try:
+            slot_date = slot.get("date", "")
+            slot_start = slot.get("start", "")
+            slot_end = slot.get("end", "")
+
+            if not (slot_date and slot_start and slot_end):
+                continue
+
+            # Parse slot times in source timezone
+            slot_start_dt = source_tz.localize(
+                datetime.strptime(f"{slot_date}T{slot_start}", "%Y-%m-%dT%H:%M")
+            ).astimezone(pytz.UTC)
+            slot_end_dt = source_tz.localize(
+                datetime.strptime(f"{slot_date}T{slot_end}", "%Y-%m-%dT%H:%M")
+            ).astimezone(pytz.UTC)
+
+            # Check for overlaps with any scheduled interview
+            has_conflict = False
+            for sched_start, sched_end in scheduled_ranges:
+                # Overlap exists if: slot_start < sched_end AND slot_end > sched_start
+                if slot_start_dt < sched_end and slot_end_dt > sched_start:
+                    has_conflict = True
+                    break
+
+            if not has_conflict:
+                filtered_slots.append(slot)
+        except Exception:
+            # If parsing fails, include the slot to be safe
+            filtered_slots.append(slot)
+
+    return filtered_slots
+
+
 def parse_slots_from_text(text: str) -> List[Dict[str, str]]:
     """
     Use OpenAI to parse free/busy text into slots.
@@ -4000,34 +4085,49 @@ def main() -> None:
                         else:
                             email_slots.append(slot)
 
-                    html_body = build_branded_email_html(
-                        candidate_name=candidate_name,
-                        role_title=role_title or "Position",
-                        slots=email_slots,
-                        company=company,
+                    # Filter out slots that have already been scheduled
+                    scheduled_interviews = audit.get_active_interviews()
+                    slots_before_filter = len(email_slots)
+                    email_slots = filter_out_scheduled_slots(
+                        email_slots,
+                        scheduled_interviews,
                         source_timezone=tz_name,
-                        target_timezone=candidate_timezone,
                     )
-                    plain_body = build_branded_email_plain(
-                        candidate_name=candidate_name,
-                        role_title=role_title or "Position",
-                        slots=email_slots,
-                        company=company,
-                        source_timezone=tz_name,
-                        target_timezone=candidate_timezone,
-                    )
-                    st.session_state["candidate_email_html"] = html_body
-                    st.session_state["candidate_email_plain"] = plain_body
-                    st.session_state["candidate_email_generated_at"] = datetime.now().strftime("%H:%M:%S")
+                    slots_removed = slots_before_filter - len(email_slots)
+                    if slots_removed > 0:
+                        st.info(f"Excluded {slots_removed} slot(s) that already have interviews scheduled.")
 
-                    if len(selected_interviewers) == 1:
-                        interviewer_note = f" (for {selected_interviewers[0]['name']})"
-                    elif len(selected_interviewers) > 1:
-                        names = ", ".join([i['name'] for i in selected_interviewers])
-                        interviewer_note = f" (panel: {names})"
+                    if not email_slots:
+                        st.error("No available slots remaining after excluding already-scheduled interviews.")
                     else:
-                        interviewer_note = ""
-                    st.success(f"Generated branded HTML email template with {len(email_slots)} slot(s){interviewer_note}")
+                        html_body = build_branded_email_html(
+                            candidate_name=candidate_name,
+                            role_title=role_title or "Position",
+                            slots=email_slots,
+                            company=company,
+                            source_timezone=tz_name,
+                            target_timezone=candidate_timezone,
+                        )
+                        plain_body = build_branded_email_plain(
+                            candidate_name=candidate_name,
+                            role_title=role_title or "Position",
+                            slots=email_slots,
+                            company=company,
+                            source_timezone=tz_name,
+                            target_timezone=candidate_timezone,
+                        )
+                        st.session_state["candidate_email_html"] = html_body
+                        st.session_state["candidate_email_plain"] = plain_body
+                        st.session_state["candidate_email_generated_at"] = datetime.now().strftime("%H:%M:%S")
+
+                        if len(selected_interviewers) == 1:
+                            interviewer_note = f" (for {selected_interviewers[0]['name']})"
+                        elif len(selected_interviewers) > 1:
+                            names = ", ".join([i['name'] for i in selected_interviewers])
+                            interviewer_note = f" (panel: {names})"
+                        else:
+                            interviewer_note = ""
+                        st.success(f"Generated branded HTML email template with {len(email_slots)} slot(s){interviewer_note}")
 
             if st.session_state.get("candidate_email_html"):
                 gen_time = st.session_state.get("candidate_email_generated_at", "unknown")

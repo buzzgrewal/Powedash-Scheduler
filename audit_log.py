@@ -583,6 +583,37 @@ class AuditLog:
             )
             return []
 
+    def get_active_interviews(self) -> List[Dict[str, Any]]:
+        """
+        Get all active (non-cancelled, non-deleted) interviews.
+        Used for filtering out already-scheduled time slots.
+
+        Returns list of interviews with start_utc and end_utc fields.
+        Returns empty list on error.
+        """
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM interviews
+                    WHERE last_status NOT IN ('cancelled', 'deleted')
+                    ORDER BY start_utc ASC
+                    """
+                ).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            log_structured(
+                LogLevel.ERROR,
+                f"Active interviews fetch failed: {e}",
+                action="get_active_interviews",
+                error_type="sqlite_error",
+                exc_info=True,
+            )
+            return []
+
     def update_interview_status(
         self,
         event_id: str,
