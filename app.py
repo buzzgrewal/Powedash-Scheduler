@@ -934,7 +934,6 @@ TEXT TO PARSE:
     try:
         resp = client.chat.completions.create(
             model=get_secret("openai_model", "gpt-5.2"),
-            temperature=0,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that returns strict JSON. Never include markdown formatting."},
                 {"role": "user", "content": prompt},

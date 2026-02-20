@@ -9,6 +9,7 @@ slot extraction.
 import base64
 import io
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -335,7 +336,6 @@ class CalendarParser:
         try:
             resp = self.client.chat.completions.create(
                 model=self.model,
-                temperature=0,
                 messages=[
                     {"role": "system", "content": "You analyze calendar images and return JSON."},
                     {
@@ -366,6 +366,7 @@ class CalendarParser:
                 return CalendarFormat.UNKNOWN, confidence, reasoning
 
         except Exception as e:
+            logging.error("Calendar format detection failed: %s", e)
             return CalendarFormat.UNKNOWN, 0.0, str(e)
 
     def _build_extraction_prompt(
@@ -421,7 +422,6 @@ class CalendarParser:
         try:
             resp = self.client.chat.completions.create(
                 model=self.model,
-                temperature=0,
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant that returns strict JSON."},
                     {
@@ -443,8 +443,10 @@ class CalendarParser:
             return slots if isinstance(slots, list) else [], raw_response
 
         except json.JSONDecodeError:
+            logging.error("Calendar slot extraction returned invalid JSON: %s", content if 'content' in locals() else "(empty)")
             return [], content if 'content' in locals() else ""
         except Exception as e:
+            logging.error("Calendar slot extraction failed: %s", e)
             return [], str(e)
 
     def _validate_and_filter_slots(
