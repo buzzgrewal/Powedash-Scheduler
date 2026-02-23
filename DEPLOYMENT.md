@@ -42,7 +42,7 @@ Each client gets:
 
 ---
 
-## Server Information (Example)
+## Server Information
 
 | Property | Value |
 |----------|-------|
@@ -50,6 +50,13 @@ Each client gets:
 | IP | 104.207.95.232 |
 | Domain | powerdashscheduler.com |
 | OS | Ubuntu 24.04 |
+
+### SSH Access
+
+```bash
+ssh root@104.207.95.232
+```
+**Password:** `FeI092vml7Mda5ES6L`
 
 ---
 
