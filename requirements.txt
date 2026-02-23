@@ -6,3 +6,5 @@ pytz
 requests
 tzdata
 python-docx
+numpy<2.0.0
+pandas

@@ -1,0 +1,52 @@
+version: "3.8"
+
+services:
+  app:
+    image: powerdash-hr:latest
+    container_name: powerdash-${CLIENT_NAME}
+    restart: unless-stopped
+    ports:
+      - "${PORT}:8501"
+    environment:
+      # Microsoft Graph API
+      - GRAPH_TENANT_ID=${GRAPH_TENANT_ID}
+      - GRAPH_CLIENT_ID=${GRAPH_CLIENT_ID}
+      - GRAPH_CLIENT_SECRET=${GRAPH_CLIENT_SECRET}
+      - GRAPH_SCHEDULER_MAILBOX=${GRAPH_SCHEDULER_MAILBOX}
+      # OpenAI
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4}
+      # SMTP
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USERNAME=${SMTP_USERNAME}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_FROM=${SMTP_FROM}
+      # IMAP
+      - IMAP_HOST=${IMAP_HOST}
+      - IMAP_PORT=${IMAP_PORT:-993}
+      - IMAP_USERNAME=${IMAP_USERNAME}
+      - IMAP_PASSWORD=${IMAP_PASSWORD}
+      # Application
+      - CLIENT_NAME=${CLIENT_NAME}
+      - CLIENT_DISPLAY_NAME=${CLIENT_DISPLAY_NAME}
+      - DEFAULT_TIMEZONE=${DEFAULT_TIMEZONE:-UTC}
+    volumes:
+      - powerdash-${CLIENT_NAME}-data:/app/data
+      - ./branding_config.yaml:/app/branding_config.yaml:ro
+      - ./assets:/app/assets:ro
+    networks:
+      - powerdash-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  powerdash-${CLIENT_NAME}-data:
+
+networks:
+  powerdash-network:
+    external: true

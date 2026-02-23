@@ -318,7 +318,7 @@ class ICSInvite:
                 f"DTSTART:{_fmt_dt_utc(self.dtstart_utc)}",
                 f"DTEND:{_fmt_dt_utc(self.dtend_utc)}",
                 f"SUMMARY:{_escape_text(self.summary)}",
-                f"DESCRIPTION:{_escape_text(self.description + (('\\n' + self.url) if self.url else ''))}",
+                f"DESCRIPTION:{_escape_text(self.description + (chr(10) + self.url if self.url else ''))}",
                 f"STATUS:{self.status}",
                 f"SEQUENCE:{self.sequence}",
             ])
