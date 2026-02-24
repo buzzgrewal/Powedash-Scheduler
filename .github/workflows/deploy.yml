@@ -1,0 +1,82 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 104.207.95.232
+          username: root
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: 22
+          script: |
+            echo "=== Starting Deployment ==="
+
+            # Navigate to app directory
+            cd /opt/powerdash/app
+
+            # Pull latest code from GitHub
+            echo "Pulling latest code..."
+            rm -rf /tmp/newcode
+            git clone https://github.com/buzzgrewal/Powedash-Scheduler.git /tmp/newcode
+
+            # Backup secrets
+            cp /opt/powerdash/app/.streamlit/secrets.toml /tmp/secrets_backup.toml 2>/dev/null || true
+
+            # Remove old Python files and copy new ones
+            rm -f /opt/powerdash/app/*.py
+            rm -f /opt/powerdash/app/*.json
+            cp -r /tmp/newcode/*.py /opt/powerdash/app/
+            cp -r /tmp/newcode/*.json /opt/powerdash/app/ 2>/dev/null || true
+            cp -r /tmp/newcode/requirements.txt /opt/powerdash/app/
+            cp -r /tmp/newcode/Dockerfile /opt/powerdash/app/ 2>/dev/null || true
+
+            # Restore secrets
+            mkdir -p /opt/powerdash/app/.streamlit
+            cp /tmp/secrets_backup.toml /opt/powerdash/app/.streamlit/secrets.toml 2>/dev/null || true
+
+            # Apply ics_utils.py fix
+            echo "Applying code fixes..."
+            python3 << 'PYEOF'
+            lines = open('/opt/powerdash/app/ics_utils.py').readlines()
+            for i, line in enumerate(lines):
+                if "(('\\n' + self.url)" in line:
+                    lines[i] = line.replace("(('\\n' + self.url)", "(chr(10) + self.url")
+            open('/opt/powerdash/app/ics_utils.py', 'w').writelines(lines)
+            print('Code fixes applied!')
+            PYEOF
+
+            # Cleanup
+            rm -rf /tmp/newcode
+
+            # Rebuild Docker image
+            echo "Building Docker image..."
+            cd /opt/powerdash/app
+            docker build --no-cache -t powerdash-hr:latest .
+
+            # Restart all client containers
+            echo "Restarting all clients..."
+            for client_dir in /opt/powerdash/clients/*/; do
+              if [ -d "$client_dir" ]; then
+                client_name=$(basename "$client_dir")
+                echo "Restarting client: $client_name"
+                cd "$client_dir"
+                docker compose down
+                docker compose up -d
+              fi
+            done
+
+            echo "=== Deployment Complete ==="
+            docker ps | grep powerdash
