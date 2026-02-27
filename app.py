@@ -320,10 +320,10 @@ def _save_persisted_slots() -> None:
     """Save current slots and panel interviewer data to persistent storage."""
     path = _get_slots_path()
     try:
-        # Serialize panel_interviewers without the non-serializable 'file' field
+        # Serialize panel_interviewers without the non-serializable 'files' field
         panel = st.session_state.get("panel_interviewers", [])
         serializable_panel = [
-            {k: v for k, v in interviewer.items() if k != "file"}
+            {k: v for k, v in interviewer.items() if k != "files"}
             for interviewer in panel
         ]
         data = {
@@ -650,6 +650,13 @@ def parse_slots_from_image(image: Image.Image, interviewer_timezone: Optional[st
             if "parser_debug_info" not in st.session_state:
                 st.session_state["parser_debug_info"] = []
             st.session_state["parser_debug_info"].append(debug_info)
+
+        # Accumulate rejected slot reasons for UI feedback
+        if result.rejected_reasons:
+            prev = st.session_state.get("parser_rejected_reasons", {})
+            for reason, count in result.rejected_reasons.items():
+                prev[reason] = prev.get(reason, 0) + count
+            st.session_state["parser_rejected_reasons"] = prev
 
         # Convert to legacy format (backward compatible)
         return result.to_legacy_format()
@@ -1037,7 +1044,7 @@ def ensure_session_state() -> None:
         "candidate_timezone": get_default_timezone(),
         "duration_minutes": 60,
         # Panel interview support
-        "panel_interviewers": [],  # List of {id, name, email, file, slots, timezone}
+        "panel_interviewers": [],  # List of {id, name, email, files, slots, timezone}
         "next_interviewer_id": 1,  # Auto-increment for unique widget keys
         "slot_filter_mode": "all_available",  # "all_available" | "any_n" | "show_all"
         "slot_filter_min_n": 1,  # Minimum N for "any_n" mode
@@ -1068,9 +1075,9 @@ def ensure_session_state() -> None:
             st.session_state["slots"] = saved_slots["slots"]
             st.session_state["computed_intersections"] = saved_slots.get("computed_intersections", [])
         if saved_slots.get("panel_interviewers"):
-            # Restore panel interviewers (add file=None since uploads don't persist)
+            # Restore panel interviewers (add files=[] since uploads don't persist)
             restored_panel = [
-                {**interviewer, "file": None}
+                {**interviewer, "files": []}
                 for interviewer in saved_slots["panel_interviewers"]
             ]
             st.session_state["panel_interviewers"] = restored_panel
@@ -3604,7 +3611,7 @@ def main() -> None:
                     "id": new_id,
                     "name": "",
                     "email": "",
-                    "file": None,
+                    "files": [],
                     "slots": [],
                     "timezone": st.session_state["selected_timezone"],
                 }]
@@ -3655,13 +3662,14 @@ def main() -> None:
                     )
                     interviewers[idx]["timezone"] = interviewer_tz
 
-                    # File uploader
+                    # File uploader (multiple files supported)
                     uploaded = st.file_uploader(
                         f"Calendar ({interviewer.get('name') or f'Interviewer {idx+1}'})",
                         type=["pdf", "png", "jpg", "jpeg", "docx"],
                         key=f"file_{interviewer['id']}",
+                        accept_multiple_files=True,
                     )
-                    interviewers[idx]["file"] = uploaded
+                    interviewers[idx]["files"] = uploaded or []
 
                     # Show slot count with breakdown
                     slot_count = len(interviewer.get("slots", []))
@@ -3676,7 +3684,7 @@ def main() -> None:
                             st.caption(f"{slot_count} uploaded slot(s)")
 
                     # Per-interviewer parse button
-                    if interviewer.get("file") or interviewer.get("slots"):
+                    if interviewer.get("files") or interviewer.get("slots"):
                         if st.button(
                             f"Parse {interviewer.get('name') or f'Interviewer {idx+1}'}",
                             key=f"parse_single_{interviewer['id']}",
@@ -3705,7 +3713,7 @@ def main() -> None:
                     "id": new_id,
                     "name": "",
                     "email": "",
-                    "file": None,
+                    "files": [],
                     "slots": [],
                     "timezone": st.session_state["selected_timezone"],
                 })
@@ -5310,6 +5318,25 @@ def main() -> None:
 # ----------------------------
 # Internal UI handlers
 # ----------------------------
+def _format_rejected_reasons(reasons: Dict[str, int]) -> str:
+    """Format parser rejection reasons into a human-readable message."""
+    labels = {
+        "past_date": "in the past",
+        "weekend": "on a weekend",
+        "invalid_date": "had invalid dates",
+        "invalid_format": "had invalid format",
+        "missing_fields": "were missing required fields",
+        "invalid_time_range": "had invalid time ranges",
+        "too_short": "were too short",
+        "invalid_time": "had invalid times",
+    }
+    parts = []
+    for reason, count in reasons.items():
+        label = labels.get(reason, reason)
+        parts.append(f"{count} {label}")
+    return ", ".join(parts)
+
+
 def _parse_availability_upload(upload, interviewer_timezone: Optional[str] = None, display_timezone: Optional[str] = None) -> List[Dict[str, str]]:
     data = upload.read()
     name = (upload.name or "").lower()
@@ -5366,14 +5393,46 @@ def _parse_single_interviewer_availability(interviewer_idx: int) -> None:
     existing_manual_slots = [s for s in interviewer.get("slots", []) if s.get("source") == "manual"]
 
     try:
-        if interviewer.get("file"):
-            interviewer["file"].seek(0)
-            uploaded_slots = _parse_availability_upload(interviewer["file"], interviewer_tz, tz_name)
-            for s in uploaded_slots:
-                s["source"] = "uploaded"
+        if interviewer.get("files"):
+            uploaded_slots = []
+            all_rejected = {}
+            file_errors = []
+            for f in interviewer["files"]:
+                try:
+                    f.seek(0)
+                    st.session_state.pop("parser_rejected_reasons", None)
+                    file_slots = _parse_availability_upload(f, interviewer_tz, tz_name)
+                    for s in file_slots:
+                        s["source"] = "uploaded"
+                    uploaded_slots.extend(file_slots)
+                    rejected = st.session_state.pop("parser_rejected_reasons", {})
+                    for reason, count in rejected.items():
+                        all_rejected[reason] = all_rejected.get(reason, 0) + count
+                except Exception as file_err:
+                    fname = getattr(f, "name", "unknown")
+                    file_errors.append(f"{fname}: {file_err}")
+            # Report per-file errors but continue with successfully parsed slots
+            for err in file_errors:
+                st.error(f"{interviewer_name} — {err}")
+            # Cross-file dedup
+            uniq = {(s["date"], s["start"], s["end"]): s for s in uploaded_slots}
+            uploaded_slots = list(uniq.values())
             interviewer["slots"] = _merge_slots(existing_manual_slots, uploaded_slots)
             uploaded_count = len(uploaded_slots)
-            st.success(f"Parsed {uploaded_count} slot(s) for {interviewer_name}.")
+            if uploaded_count > 0 and all_rejected:
+                st.success(
+                    f"Parsed {uploaded_count} slot(s) for {interviewer_name}. "
+                    f"Filtered out: {_format_rejected_reasons(all_rejected)}."
+                )
+            elif uploaded_count > 0:
+                st.success(f"Parsed {uploaded_count} slot(s) for {interviewer_name}.")
+            elif all_rejected:
+                st.warning(
+                    f"Parsed 0 slot(s) for {interviewer_name}. "
+                    f"All extracted slots were filtered: {_format_rejected_reasons(all_rejected)}."
+                )
+            else:
+                st.warning(f"Parsed 0 slot(s) for {interviewer_name}. No slots could be extracted from the file(s).")
         elif existing_manual_slots:
             interviewer["slots"] = existing_manual_slots
             st.info(f"No file uploaded for {interviewer_name}. Using {len(existing_manual_slots)} manual slot(s).")
@@ -5444,6 +5503,7 @@ def _parse_all_panel_availability() -> None:
     all_interviewer_slots: Dict[int, List] = {}
     interviewer_names: Dict[int, str] = {}
     parse_errors = []
+    parse_warnings = []
     total_uploaded = 0
     total_manual = 0
 
@@ -5454,15 +5514,42 @@ def _parse_all_panel_availability() -> None:
         interviewer_tz = interviewer.get("timezone", tz_name)
 
         try:
-            if interviewer.get("file"):
-                # Reset file position before reading
-                interviewer["file"].seek(0)
-                # Parse the uploaded file
-                uploaded_slots = _parse_availability_upload(interviewer["file"], interviewer_tz, tz_name)
-                # Mark uploaded slots with source
-                for s in uploaded_slots:
-                    s["source"] = "uploaded"
+            if interviewer.get("files"):
+                uploaded_slots = []
+                all_rejected = {}
+                file_errors = []
+                for f in interviewer["files"]:
+                    try:
+                        f.seek(0)
+                        st.session_state.pop("parser_rejected_reasons", None)
+                        file_slots = _parse_availability_upload(f, interviewer_tz, tz_name)
+                        for s in file_slots:
+                            s["source"] = "uploaded"
+                        uploaded_slots.extend(file_slots)
+                        rejected = st.session_state.pop("parser_rejected_reasons", {})
+                        for reason, count in rejected.items():
+                            all_rejected[reason] = all_rejected.get(reason, 0) + count
+                    except Exception as file_err:
+                        fname = getattr(f, "name", "unknown")
+                        iname_err = interviewer.get("name") or f"Interviewer {interviewer.get('id', '?')}"
+                        file_errors.append(f"{iname_err} — {fname}: {file_err}")
+                # Report per-file errors but continue with successfully parsed slots
+                parse_errors.extend(file_errors)
+                # Cross-file dedup
+                uniq = {(s["date"], s["start"], s["end"]): s for s in uploaded_slots}
+                uploaded_slots = list(uniq.values())
                 total_uploaded += len(uploaded_slots)
+                # Report rejection reasons per interviewer
+                if all_rejected:
+                    iname = interviewer.get("name") or f"Interviewer {interviewer.get('id', '?')}"
+                    if len(uploaded_slots) == 0:
+                        parse_warnings.append(
+                            f"{iname}: all extracted slots were filtered — {_format_rejected_reasons(all_rejected)}"
+                        )
+                    else:
+                        parse_warnings.append(
+                            f"{iname}: parsed {len(uploaded_slots)} slot(s), filtered out: {_format_rejected_reasons(all_rejected)}"
+                        )
                 # Merge manual + uploaded, preferring manual for duplicates
                 interviewer["slots"] = _merge_slots(existing_manual_slots, uploaded_slots)
             elif existing_manual_slots:
@@ -5487,6 +5574,9 @@ def _parse_all_panel_availability() -> None:
     if parse_errors:
         for err in parse_errors:
             st.error(err)
+    if parse_warnings:
+        for warn in parse_warnings:
+            st.warning(warn)
 
     # Compute intersection
     if all_interviewer_slots:

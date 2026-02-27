@@ -11,7 +11,7 @@ import io
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -57,6 +57,7 @@ class ParseResult:
     preprocessing_applied: List[str]
     raw_response: Optional[str] = None
     error: Optional[str] = None
+    rejected_reasons: Dict[str, int] = field(default_factory=dict)
 
     def to_legacy_format(self) -> List[Dict[str, str]]:
         """Convert to legacy slot format for backward compatibility."""
@@ -452,16 +453,26 @@ class CalendarParser:
     def _validate_and_filter_slots(
         self,
         raw_slots: List[Dict[str, Any]]
-    ) -> List[ParsedSlot]:
+    ) -> Tuple[List[ParsedSlot], Dict[str, int]]:
         """
         Validate and filter slots, applying business rules.
+
+        Returns:
+            Tuple of (valid_slots, rejected_reasons) where rejected_reasons
+            maps reason strings to counts of slots rejected for that reason.
         """
         valid_slots = []
+        rejected: Dict[str, int] = {}
+
+        def _reject(reason: str) -> None:
+            rejected[reason] = rejected.get(reason, 0) + 1
 
         for s in raw_slots:
             if not isinstance(s, dict):
+                _reject("invalid_format")
                 continue
             if not all(k in s for k in ("date", "start", "end")):
+                _reject("missing_fields")
                 continue
 
             slot_date = str(s.get("date", ""))
@@ -474,8 +485,13 @@ class CalendarParser:
             try:
                 dt = datetime.strptime(slot_date, "%Y-%m-%d")
                 if dt.weekday() >= 5:  # Saturday=5, Sunday=6
+                    _reject("weekend")
+                    continue
+                if dt.date() < date.today():
+                    _reject("past_date")
                     continue
             except ValueError:
+                _reject("invalid_date")
                 continue
 
             # Clamp to business hours
@@ -486,6 +502,7 @@ class CalendarParser:
 
             # Validate time range
             if slot_start >= slot_end:
+                _reject("invalid_time_range")
                 continue
 
             # Check minimum duration
@@ -494,8 +511,10 @@ class CalendarParser:
                 end_dt = datetime.strptime(slot_end, "%H:%M")
                 duration_minutes = (end_dt - start_dt).seconds / 60
                 if duration_minutes < self.config.min_slot_minutes:
+                    _reject("too_short")
                     continue
             except ValueError:
+                _reject("invalid_time")
                 continue
 
             valid_slots.append(ParsedSlot(
@@ -506,7 +525,7 @@ class CalendarParser:
                 inferred_tz=str(inferred_tz) if inferred_tz else None
             ))
 
-        return valid_slots
+        return valid_slots, rejected
 
     def parse_image(
         self,
@@ -560,12 +579,13 @@ class CalendarParser:
         raw_slots, raw_response = self._extract_slots(processed_image, prompt)
 
         # Validate and filter
-        valid_slots = self._validate_and_filter_slots(raw_slots)
+        valid_slots, rejected_reasons = self._validate_and_filter_slots(raw_slots)
 
         return ParseResult(
             slots=valid_slots,
             detected_format=detected_format,
             format_confidence=format_confidence,
             preprocessing_applied=preprocessing_applied,
-            raw_response=raw_response if self.config.debug_mode else None
+            raw_response=raw_response if self.config.debug_mode else None,
+            rejected_reasons=rejected_reasons,
         )
