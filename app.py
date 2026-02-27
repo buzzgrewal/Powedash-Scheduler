@@ -411,6 +411,54 @@ def _delete_email_template(name: str) -> bool:
     return False
 
 
+def _get_invite_templates_path() -> str:
+    """Get path for persistent invite detail templates file."""
+    return get_secret("invite_templates_path", "invite_templates.json")
+
+
+def _load_invite_templates() -> Dict[str, Any]:
+    """Load saved invite detail templates from persistent storage."""
+    path = _get_invite_templates_path()
+    try:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_invite_template(name: str, template: Dict[str, Any]) -> bool:
+    """Save an invite detail template to persistent storage."""
+    path = _get_invite_templates_path()
+    try:
+        templates = _load_invite_templates()
+        templates[name] = template
+        with open(path, 'w') as f:
+            json.dump(templates, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Could not save invite template: {e}")
+        return False
+
+
+def _delete_invite_template(name: str) -> bool:
+    """Delete an invite detail template from persistent storage."""
+    path = _get_invite_templates_path()
+    try:
+        templates = _load_invite_templates()
+        if name in templates:
+            del templates[name]
+            with open(path, 'w') as f:
+                json.dump(templates, f, indent=2)
+            return True
+    except Exception as e:
+        st.error(f"Could not delete invite template: {e}")
+    return False
+
+
 def get_graph_config() -> Optional[GraphConfig]:
     tenant_id = get_secret("graph_tenant_id")
     client_id = get_secret("graph_client_id")
@@ -3897,12 +3945,69 @@ def main() -> None:
                     pass
 
             st.markdown("#### Invite details")
+
+            # --- Invite template load/save ---
+            invite_templates = _load_invite_templates()
+            template_names = list(invite_templates.keys())
+
+            if template_names:
+                load_col, del_col = st.columns([3, 1])
+                with load_col:
+                    chosen_template = st.selectbox(
+                        "Load template",
+                        options=["— None —"] + template_names,
+                        index=0,
+                        key="invite_template_select",
+                    )
+                with del_col:
+                    st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+                    if chosen_template != "— None —":
+                        if st.button("Delete", key="delete_invite_tpl", type="secondary"):
+                            if _delete_invite_template(chosen_template):
+                                if st.session_state.get("_last_invite_tpl") == chosen_template:
+                                    st.session_state["_last_invite_tpl"] = None
+                                st.toast(f"Template '{chosen_template}' deleted.")
+                                st.rerun()
+
+                # Only apply template values when the selection actually changes
+                prev_tpl = st.session_state.get("_last_invite_tpl")
+                if chosen_template != "— None —" and chosen_template in invite_templates and chosen_template != prev_tpl:
+                    tpl = invite_templates[chosen_template]
+                    st.session_state["interview_type"] = tpl.get("interview_type", "Teams")
+                    st.session_state["subject"] = tpl.get("subject", "")
+                    st.session_state["agenda"] = tpl.get("agenda", "")
+                    st.session_state["location"] = tpl.get("location", "")
+                    st.session_state["include_recruiter"] = tpl.get("include_recruiter", True)
+                    st.session_state["_last_invite_tpl"] = chosen_template
+                    st.rerun()
+                elif chosen_template == "— None —":
+                    st.session_state["_last_invite_tpl"] = None
+
             is_teams = st.selectbox("Interview type", options=["Teams", "Non-Teams"], index=0, key="interview_type") == "Teams"
             subject = st.text_input("Subject/title", value=f"Interview: {role_title}" if role_title else "Interview", key="subject")
             agenda = st.text_area("Description/agenda", value="Interview discussion.", key="agenda")
             location = st.text_input("Location (non-Teams)", value="", key="location")
 
             include_recruiter = st.checkbox("Include recruiter as attendee", value=True, key="include_recruiter")
+
+            # Save current values as template
+            with st.expander("Save as template"):
+                tpl_name = st.text_input("Template name", key="invite_tpl_name", placeholder="e.g. Technical Interview")
+                if st.button("Save template", key="save_invite_tpl"):
+                    clean_name = (tpl_name or "").strip()
+                    if not clean_name:
+                        st.warning("Please enter a template name.")
+                    elif clean_name == "— None —":
+                        st.warning("This name is reserved. Please choose a different name.")
+                    elif _save_invite_template(clean_name, {
+                            "interview_type": "Teams" if is_teams else "Non-Teams",
+                            "subject": subject,
+                            "agenda": agenda,
+                            "location": location,
+                            "include_recruiter": include_recruiter,
+                        }):
+                        st.toast(f"Template '{clean_name}' saved.")
+                        st.rerun()
 
             st.markdown("----")
             st.markdown("#### Actions")
