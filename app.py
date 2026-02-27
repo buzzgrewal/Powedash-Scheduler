@@ -349,7 +349,9 @@ def _load_branding_settings() -> Dict[str, Any]:
     try:
         if os.path.exists(path):
             with open(path, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
     except Exception:
         pass
     return {}
@@ -480,9 +482,12 @@ def get_company_config() -> CompanyConfig:
     Load company branding configuration.
     Checks session state for user overrides first, then falls back to secrets.
     """
+    # Use custom uploaded logo if available, otherwise fall back to secrets/default
+    logo = st.session_state.get("custom_logo_data") or get_secret("company_logo_url", "logo.png")
+
     return CompanyConfig(
         name=get_secret("company_name", "PowerDash HR"),
-        logo_url=get_secret("company_logo_url", "logo.png"),
+        logo_url=logo,
         primary_color=get_secret("company_primary_color", "#0066CC"),
         website=get_secret("company_website"),
         sender_email=get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"),
@@ -528,6 +533,10 @@ def _get_logo_src(path_or_url: Optional[str]) -> Optional[str]:
     """
     if not path_or_url:
         return None
+
+    # If it's already a data URL (e.g. from uploaded logo), return as-is
+    if path_or_url.startswith('data:'):
+        return path_or_url
 
     # If it's a URL, return as-is
     if path_or_url.startswith(('http://', 'https://')):
@@ -1067,6 +1076,13 @@ def ensure_session_state() -> None:
             st.session_state["panel_interviewers"] = restored_panel
             st.session_state["next_interviewer_id"] = saved_slots.get("next_interviewer_id", 1)
         st.session_state["_slots_loaded"] = True
+
+    # Load persisted branding (logo) on first run
+    if not st.session_state.get("_branding_loaded"):
+        saved_branding = _load_branding_settings()
+        if saved_branding.get("logo_data"):
+            st.session_state["custom_logo_data"] = saved_branding["logo_data"]
+        st.session_state["_branding_loaded"] = True
 
 
 def format_slot_label(slot: Dict[str, str]) -> str:
@@ -3459,6 +3475,75 @@ def _save_current_branding() -> None:
 #         st.caption("Powered by PowerDash HR")
 
 
+def _update_branding_logo(logo_data: Optional[str]) -> None:
+    """Persist logo_data by merging into existing branding settings (not overwriting)."""
+    existing = _load_branding_settings()
+    if logo_data is None:
+        existing.pop("logo_data", None)
+    else:
+        existing["logo_data"] = logo_data
+    _save_branding_settings(existing)
+
+
+_MAX_LOGO_BYTES = 2 * 1024 * 1024  # 2 MB
+
+
+def _render_logo_settings() -> None:
+    """Render a sidebar section for uploading a custom header logo."""
+    with st.sidebar:
+        st.markdown("### ⚙️ Settings")
+
+        st.markdown("**Company Logo**")
+
+        current_logo = st.session_state.get("custom_logo_data")
+        if current_logo:
+            st.image(current_logo, width=150)
+            if st.button("Remove Logo", key="remove_logo_btn"):
+                st.session_state["custom_logo_data"] = None
+                _update_branding_logo(None)
+                st.rerun()
+        else:
+            default_logo_path = get_secret("company_logo_url", "logo.png")
+            logo_src = _get_logo_src(default_logo_path)
+            if logo_src:
+                st.image(logo_src, width=150)
+                st.caption("Default logo")
+
+        uploaded_logo = st.file_uploader(
+            "Upload New Logo",
+            type=["png", "jpg", "jpeg", "gif", "svg"],
+            key="logo_uploader",
+            help="Upload a company logo (PNG, JPG, GIF, or SVG). Max 2 MB."
+        )
+
+        if uploaded_logo is not None:
+            data = uploaded_logo.read()
+            if not data:
+                pass
+            elif len(data) > _MAX_LOGO_BYTES:
+                st.warning(
+                    f"Logo file is too large ({len(data) // 1024} KB). "
+                    "Maximum allowed size is 2 MB."
+                )
+            else:
+                ext = os.path.splitext(uploaded_logo.name)[1].lower()
+                mime_types = {
+                    '.png': 'image/png',
+                    '.jpg': 'image/jpeg',
+                    '.jpeg': 'image/jpeg',
+                    '.gif': 'image/gif',
+                    '.svg': 'image/svg+xml',
+                }
+                mime_type = mime_types.get(ext, 'image/png')
+                b64 = base64.b64encode(data).decode('utf-8')
+                data_url = f"data:{mime_type};base64,{b64}"
+
+                if data_url != st.session_state.get("custom_logo_data"):
+                    st.session_state["custom_logo_data"] = data_url
+                    _update_branding_logo(data_url)
+                    st.rerun()
+
+
 # ----------------------------
 # Streamlit UI - Main App
 # ----------------------------
@@ -3470,26 +3555,15 @@ def main() -> None:
         page_title=f"{base_name} Interview Scheduler",
         page_icon=get_secret("company_favicon_url", "🗓️"),
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="auto",
     )
 
     ensure_session_state()
 
-    # NOTE: Sidebar customization and custom background colors disabled - using default Streamlit styling
-    # # Apply brand theme CSS immediately so all UI elements use brand colors
-    # company = get_company_config()
-    # background_color = st.session_state.get("custom_background_color")
-    # _apply_brand_theme(company, background_color)
+    # Render logo upload settings in sidebar
+    _render_logo_settings()
 
-    # # Render branding settings sidebar
-    # _render_branding_sidebar()
-
-    # # Refresh company config in case sidebar changed it
-    # company = get_company_config()
-    # layout = get_layout_config()
-    # background_color = st.session_state.get("custom_background_color")
-
-    # Use default company config without sidebar customization
+    # Load company config (uses custom logo from session state if uploaded)
     company = get_company_config()
     layout = get_layout_config()
 
