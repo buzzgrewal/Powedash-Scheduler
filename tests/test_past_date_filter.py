@@ -26,15 +26,19 @@ import pytest
 # ---------------------------------------------------------------------------
 # Mock streamlit at module level (same pattern as existing tests)
 # ---------------------------------------------------------------------------
-_mock_st = MagicMock()
-_mock_st.secrets = {}
-_mock_st.session_state = {}
-_mock_st.cache_data = lambda *a, **kw: (lambda f: f)
-_mock_st.cache_resource = lambda *a, **kw: (lambda f: f)
+_local_mock = MagicMock()
+_local_mock.secrets = {}
+_local_mock.session_state = {}
+_local_mock.cache_data = lambda *a, **kw: (lambda f: f)
+_local_mock.cache_resource = lambda *a, **kw: (lambda f: f)
 
-sys.modules.setdefault("streamlit", _mock_st)
+sys.modules.setdefault("streamlit", _local_mock)
 sys.modules.setdefault("streamlit.components", MagicMock())
 sys.modules.setdefault("streamlit.components.v1", MagicMock())
+
+# Always use the mock that's actually in sys.modules, not our local one,
+# because when tests run together the first test file's mock wins.
+_mock_st = sys.modules["streamlit"]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

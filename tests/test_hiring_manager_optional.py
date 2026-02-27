@@ -31,16 +31,20 @@ from ics_utils import ICSInvite, stable_uid
 # Mock streamlit at module level to avoid segfaults on Python 3.13
 # (patch.dict teardown of sys.modules triggers CPython bug)
 # ---------------------------------------------------------------------------
-_mock_st = MagicMock()
-_mock_st.secrets = {}
-_mock_st.session_state = {}
-_mock_st.cache_data = lambda *a, **kw: (lambda f: f)
-_mock_st.cache_resource = lambda *a, **kw: (lambda f: f)
+_local_mock = MagicMock()
+_local_mock.secrets = {}
+_local_mock.session_state = {}
+_local_mock.cache_data = lambda *a, **kw: (lambda f: f)
+_local_mock.cache_resource = lambda *a, **kw: (lambda f: f)
 
 # Install mocks before importing app
-sys.modules.setdefault("streamlit", _mock_st)
+sys.modules.setdefault("streamlit", _local_mock)
 sys.modules.setdefault("streamlit.components", MagicMock())
 sys.modules.setdefault("streamlit.components.v1", MagicMock())
+
+# Always use the mock that's actually in sys.modules, not our local one,
+# because when tests run together the first test file's mock wins.
+_mock_st = sys.modules["streamlit"]
 
 import app as app_mod
 

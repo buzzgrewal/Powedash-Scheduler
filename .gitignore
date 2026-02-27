@@ -7,9 +7,11 @@
 # Database
 *.db
 
-# Persistent app state
+# Persistent app data (runtime state, user branding, audit logs)
+data/
 parsed_slots.json
 branding_settings.json
+email_templates.json
 
 # Python
 __pycache__/

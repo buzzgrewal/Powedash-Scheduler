@@ -22,15 +22,19 @@ import pytest
 # ---------------------------------------------------------------------------
 # Mock streamlit at module level (same pattern as existing tests)
 # ---------------------------------------------------------------------------
-_mock_st = MagicMock()
-_mock_st.secrets = {}
-_mock_st.session_state = {}
-_mock_st.cache_data = lambda *a, **kw: (lambda f: f)
-_mock_st.cache_resource = lambda *a, **kw: (lambda f: f)
+_local_mock = MagicMock()
+_local_mock.secrets = {}
+_local_mock.session_state = {}
+_local_mock.cache_data = lambda *a, **kw: (lambda f: f)
+_local_mock.cache_resource = lambda *a, **kw: (lambda f: f)
 
-sys.modules.setdefault("streamlit", _mock_st)
+sys.modules.setdefault("streamlit", _local_mock)
 sys.modules.setdefault("streamlit.components", MagicMock())
 sys.modules.setdefault("streamlit.components.v1", MagicMock())
+
+# Always use the mock that's actually in sys.modules, not our local one,
+# because when tests run together the first test file's mock wins.
+_mock_st = sys.modules["streamlit"]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -40,6 +44,16 @@ import app as app_mod
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def clean_streamlit_state():
+    """Reset session state and secrets before each test to prevent bleed."""
+    _mock_st.session_state = {}
+    _mock_st.secrets = {}
+    yield
+    _mock_st.session_state = {}
+    _mock_st.secrets = {}
+
+
 @pytest.fixture
 def tmp_template_file(tmp_path):
     """Create a temporary JSON file path for invite templates."""
@@ -82,16 +96,16 @@ def sample_template_nonteams():
 # 1. WHITE-BOX: _get_invite_templates_path
 # ===========================================================================
 class TestGetInviteTemplatesPath:
-    def test_returns_default_path(self):
-        """Should return 'invite_templates.json' when no secret is configured."""
-        with patch.object(app_mod, "get_secret", return_value="invite_templates.json"):
-            result = app_mod._get_invite_templates_path()
-        assert result == "invite_templates.json"
+    def test_returns_default_path_in_data_dir(self):
+        """Should return path inside data dir when no secret is configured."""
+        result = app_mod._get_invite_templates_path()
+        assert result.endswith("invite_templates.json")
+        assert "data" in result or os.sep + "data" + os.sep in result
 
     def test_returns_custom_path_from_secret(self):
         """Should respect the invite_templates_path secret."""
-        with patch.object(app_mod, "get_secret", return_value="/custom/path/tpl.json"):
-            result = app_mod._get_invite_templates_path()
+        _mock_st.secrets = {"invite_templates_path": "/custom/path/tpl.json"}
+        result = app_mod._get_invite_templates_path()
         assert result == "/custom/path/tpl.json"
 
 

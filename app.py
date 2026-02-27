@@ -293,13 +293,59 @@ def get_default_timezone() -> str:
     return get_secret("default_timezone", "UTC")
 
 
+def _get_data_dir() -> str:
+    """Get the persistent data directory, creating it if needed.
+
+    In Docker deployments, /app/data is mounted as a persistent volume.
+    Locally, falls back to a 'data' subdirectory next to app.py.
+    """
+    data_dir = get_secret("data_dir", "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
+
+
+# Legacy file names that may exist in the app root from before the data/ migration
+_LEGACY_DATA_FILES = [
+    "audit_log.db",
+    "parsed_slots.json",
+    "branding_settings.json",
+    "email_templates.json",
+    "invite_templates.json",
+]
+
+
+def _migrate_legacy_data_files() -> None:
+    """Move data files from app root to data/ directory (one-time migration).
+
+    Prior versions stored persistent files in the app root directory, which
+    is not inside the Docker persistent volume. This migrates them to data/
+    so they survive container restarts.
+    """
+    data_dir = _get_data_dir()
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+
+    for filename in _LEGACY_DATA_FILES:
+        old_path = os.path.join(app_dir, filename)
+        new_path = os.path.join(data_dir, filename)
+        try:
+            if os.path.exists(old_path) and not os.path.exists(new_path):
+                import shutil
+                shutil.move(old_path, new_path)
+        except Exception:
+            pass  # Best-effort migration; don't block startup
+
+
+# Run migration once at import time
+_migrate_legacy_data_files()
+
+
 def get_audit_log_path() -> str:
-    return get_secret("audit_log_path", "audit_log.db")
+    return get_secret("audit_log_path", os.path.join(_get_data_dir(), "audit_log.db"))
 
 
 def _get_slots_path() -> str:
     """Get path for persistent parsed slots file."""
-    return get_secret("slots_storage_path", "parsed_slots.json")
+    return get_secret("slots_storage_path", os.path.join(_get_data_dir(), "parsed_slots.json"))
 
 
 def _load_persisted_slots() -> Dict[str, Any]:
@@ -340,7 +386,7 @@ def _save_persisted_slots() -> None:
 
 def _get_branding_settings_path() -> str:
     """Get path for persistent branding settings file."""
-    return get_secret("branding_settings_path", "branding_settings.json")
+    return get_secret("branding_settings_path", os.path.join(_get_data_dir(), "branding_settings.json"))
 
 
 def _load_branding_settings() -> Dict[str, Any]:
@@ -369,7 +415,7 @@ def _save_branding_settings(settings: Dict[str, Any]) -> None:
 
 def _get_email_templates_path() -> str:
     """Get path for persistent email templates file."""
-    return get_secret("email_templates_path", "email_templates.json")
+    return get_secret("email_templates_path", os.path.join(_get_data_dir(), "email_templates.json"))
 
 
 def _load_email_templates() -> Dict[str, Any]:
@@ -415,7 +461,7 @@ def _delete_email_template(name: str) -> bool:
 
 def _get_invite_templates_path() -> str:
     """Get path for persistent invite detail templates file."""
-    return get_secret("invite_templates_path", "invite_templates.json")
+    return get_secret("invite_templates_path", os.path.join(_get_data_dir(), "invite_templates.json"))
 
 
 def _load_invite_templates() -> Dict[str, Any]:
@@ -484,11 +530,15 @@ def get_company_config() -> CompanyConfig:
     """
     # Use custom uploaded logo if available, otherwise fall back to secrets/default
     logo = st.session_state.get("custom_logo_data") or get_secret("company_logo_url", "logo.png")
+    # Use custom company name if set, otherwise fall back to secrets/default
+    name = st.session_state.get("custom_company_name") or get_secret("company_name", "PowerDash HR")
+    # Use custom primary color if set, otherwise fall back to secrets/default
+    primary_color = st.session_state.get("custom_primary_color") or get_secret("company_primary_color", "#0066CC")
 
     return CompanyConfig(
-        name=get_secret("company_name", "PowerDash HR"),
+        name=name,
         logo_url=logo,
-        primary_color=get_secret("company_primary_color", "#0066CC"),
+        primary_color=primary_color,
         website=get_secret("company_website"),
         sender_email=get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"),
     )
@@ -1084,11 +1134,15 @@ def ensure_session_state() -> None:
             st.session_state["next_interviewer_id"] = saved_slots.get("next_interviewer_id", 1)
         st.session_state["_slots_loaded"] = True
 
-    # Load persisted branding (logo) on first run
+    # Load persisted branding (logo, company name, colors) on first run
     if not st.session_state.get("_branding_loaded"):
         saved_branding = _load_branding_settings()
         if saved_branding.get("logo_data"):
             st.session_state["custom_logo_data"] = saved_branding["logo_data"]
+        if saved_branding.get("company_name"):
+            st.session_state["custom_company_name"] = saved_branding["company_name"]
+        if saved_branding.get("primary_color"):
+            st.session_state["custom_primary_color"] = saved_branding["primary_color"]
         st.session_state["_branding_loaded"] = True
 
 
@@ -3286,7 +3340,7 @@ def _render_branded_header(company: CompanyConfig) -> None:
 
 
 def _render_footer() -> None:
-    """Render footer with PowerDash branding and links."""
+    """Render footer with company branding and links."""
     st.markdown("---")
 
     css = """<style>
@@ -3298,12 +3352,13 @@ def _render_footer() -> None:
 </style>"""
     st.markdown(css, unsafe_allow_html=True)
 
+    company = get_company_config()
     powerdash_logo_path = get_secret("powerdash_logo_url", "logo.png")
     powerdash_logo_src = _get_logo_src(powerdash_logo_path)
     current_year = datetime.now().year
 
-    logo_html = f'<img src="{powerdash_logo_src}" class="footer-logo" alt="PowerDash" />' if powerdash_logo_src else ''
-    footer_html = f'<div class="app-footer"><div class="footer-left">{logo_html}<span>&copy; {current_year} PowerDash HR. All rights reserved.</span></div><div class="footer-links"><a href="https://powerdashhr.com/support" target="_blank">Support</a><a href="https://powerdashhr.com/privacy" target="_blank">Privacy</a></div></div>'
+    logo_html = f'<img src="{powerdash_logo_src}" class="footer-logo" alt="{company.name}" />' if powerdash_logo_src else ''
+    footer_html = f'<div class="app-footer"><div class="footer-left">{logo_html}<span>&copy; {current_year} {company.name}. All rights reserved.</span></div><div class="footer-links"><a href="https://powerdashhr.com/support" target="_blank">Support</a><a href="https://powerdashhr.com/privacy" target="_blank">Privacy</a></div></div>'
 
     st.markdown(footer_html, unsafe_allow_html=True)
 
@@ -3495,10 +3550,37 @@ def _update_branding_logo(logo_data: Optional[str]) -> None:
 _MAX_LOGO_BYTES = 2 * 1024 * 1024  # 2 MB
 
 
+def _update_branding_field(field: str, value: Optional[str]) -> None:
+    """Persist a single branding field by merging into existing settings."""
+    existing = _load_branding_settings()
+    if value is None:
+        existing.pop(field, None)
+    else:
+        existing[field] = value
+    _save_branding_settings(existing)
+
+
 def _render_logo_settings() -> None:
-    """Render a sidebar section for uploading a custom header logo."""
+    """Render a sidebar section for company branding settings."""
     with st.sidebar:
         st.markdown("### ⚙️ Settings")
+
+        # Company name
+        default_name = get_secret("company_name", "PowerDash HR")
+        current_name = st.session_state.get("custom_company_name") or default_name
+        new_name = st.text_input(
+            "Company Name",
+            value=current_name,
+            key="branding_name_input",
+            help="Company name shown in emails, headers, and branding"
+        )
+        if isinstance(new_name, str) and new_name.strip() and new_name != current_name:
+            if new_name != default_name:
+                st.session_state["custom_company_name"] = new_name
+                _update_branding_field("company_name", new_name)
+            else:
+                st.session_state["custom_company_name"] = None
+                _update_branding_field("company_name", None)
 
         st.markdown("**Company Logo**")
 
@@ -3556,8 +3638,9 @@ def _render_logo_settings() -> None:
 # ----------------------------
 
 def main() -> None:
-    # Page config must come first - use secrets for initial title
-    base_name = get_secret("company_name", "PowerDash HR")
+    # Page config must come first - check persisted branding before secrets fallback
+    saved = _load_branding_settings()
+    base_name = saved.get("company_name") or get_secret("company_name", "PowerDash HR")
     st.set_page_config(
         page_title=f"{base_name} Interview Scheduler",
         page_icon=get_secret("company_favicon_url", "🗓️"),
