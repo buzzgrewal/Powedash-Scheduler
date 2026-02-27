@@ -500,7 +500,7 @@ class AuditLog:
                     """
                     SELECT * FROM interviews
                     WHERE LOWER(candidate_email) = LOWER(?)
-                    AND LOWER(hiring_manager_email) = LOWER(?)
+                    AND LOWER(COALESCE(hiring_manager_email, '')) = LOWER(COALESCE(?, ''))
                     AND role_title = ?
                     AND start_utc = ?
                     AND last_status NOT IN ('cancelled', 'deleted')

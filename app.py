@@ -432,19 +432,10 @@ def get_company_config() -> CompanyConfig:
     Load company branding configuration.
     Checks session state for user overrides first, then falls back to secrets.
     """
-    # Check session state for user customizations (if initialized)
-    custom_name = st.session_state.get("custom_company_name") if hasattr(st, "session_state") else None
-    custom_logo = st.session_state.get("custom_logo_data") if hasattr(st, "session_state") else None
-    email_logo = st.session_state.get("email_logo_url") if hasattr(st, "session_state") else None
-    custom_color = st.session_state.get("custom_primary_color") if hasattr(st, "session_state") else None
-
-    # Priority: email_logo_url > custom_logo_data > secret
-    logo = email_logo or custom_logo or get_secret("company_logo_url")
-
     return CompanyConfig(
-        name=custom_name or get_secret("company_name", "PowerDash HR"),
-        logo_url=logo,
-        primary_color=custom_color or get_secret("company_primary_color", "#0066CC"),
+        name=get_secret("company_name", "PowerDash HR"),
+        logo_url=get_secret("company_logo_url", "logo.png"),
+        primary_color=get_secret("company_primary_color", "#0066CC"),
         website=get_secret("company_website"),
         sender_email=get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com"),
     )
@@ -987,7 +978,7 @@ def ensure_session_state() -> None:
         "last_invite_ics_bytes": b"",
         "selected_timezone": get_default_timezone(),
         "candidate_timezone": get_default_timezone(),
-        "duration_minutes": 30,
+        "duration_minutes": 60,
         # Panel interview support
         "panel_interviewers": [],  # List of {id, name, email, file, slots, timezone}
         "next_interviewer_id": 1,  # Auto-increment for unique widget keys
@@ -1002,13 +993,6 @@ def ensure_session_state() -> None:
         "rescheduling_interview_id": None,  # ID of interview being rescheduled (for confirmation dialog)
         "viewing_interview_history": None,  # Event ID for viewing history
         "interview_status_filter": "All",  # Status filter for interviews list
-        # Branding customization (overrides secrets) - loaded from persistent storage
-        "custom_company_name": None,  # Override company name from secrets
-        "custom_logo_data": None,  # Base64 encoded logo data
-        "email_logo_url": None,  # Logo URL for email templates
-        "custom_primary_color": None,  # Override primary brand color
-        "custom_background_color": None,  # Override background color
-        "_branding_loaded": False,  # Track if branding was loaded from file
         # Audit log view state
         "audit_view_mode": "Table",  # "Timeline" | "Table" | "Raw"
         "audit_entry_limit": 300,  # Entry limit selector
@@ -1019,16 +1003,6 @@ def ensure_session_state() -> None:
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
-
-    # Load persistent branding settings on first run
-    if not st.session_state.get("_branding_loaded"):
-        saved = _load_branding_settings()
-        if saved:
-            st.session_state["custom_company_name"] = saved.get("company_name")
-            st.session_state["custom_logo_data"] = saved.get("logo_data")
-            st.session_state["custom_primary_color"] = saved.get("primary_color")
-            st.session_state["custom_background_color"] = saved.get("background_color")
-        st.session_state["_branding_loaded"] = True
 
     # Load persisted slots on first run
     if not st.session_state.get("_slots_loaded"):
@@ -3491,7 +3465,7 @@ def main() -> None:
             st.markdown("#### Hiring Manager & Recruiter")
             role_title = st.text_input("Role Title", key="role_title")
             hiring_manager_name = st.text_input("Hiring Manager Name", key="hm_name")
-            hiring_manager_email = st.text_input("Hiring Manager Email (required)", key="hm_email")
+            hiring_manager_email = st.text_input("Hiring Manager Email (optional)", key="hm_email")
             recruiter_name = st.text_input("Recruiter Name", key="rec_name")
             recruiter_email = st.text_input("Recruiter Email (optional attendee)", key="rec_email")
             scheduler_mailbox = get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com")
@@ -3931,80 +3905,6 @@ def main() -> None:
             include_recruiter = st.checkbox("Include recruiter as attendee", value=True, key="include_recruiter")
 
             st.markdown("----")
-            st.markdown("#### Email Branding")
-
-            # Logo URL input
-            current_logo = st.session_state.get("email_logo_url") or get_secret("company_logo_url", "")
-            logo_url = st.text_input(
-                "Logo URL (for email header)",
-                value=current_logo or "",
-                placeholder="https://example.com/logo.png",
-                key="email_logo_url_input",
-                help="Enter a publicly accessible URL to your company logo. Leave blank for no logo."
-            )
-            if logo_url != st.session_state.get("email_logo_url"):
-                st.session_state["email_logo_url"] = logo_url if logo_url else None
-
-            # Template management
-            st.markdown("##### Email Templates")
-            templates = _load_email_templates()
-            template_names = list(templates.keys())
-
-            col_load, col_save = st.columns(2)
-
-            with col_load:
-                if template_names:
-                    selected_template = st.selectbox(
-                        "Load template",
-                        options=[""] + template_names,
-                        key="template_select",
-                        format_func=lambda x: "Select a template..." if x == "" else x
-                    )
-                    if selected_template and st.button("Load", key="load_template_btn"):
-                        tpl = templates[selected_template]
-                        st.session_state["email_logo_url"] = tpl.get("logo_url")
-                        if tpl.get("company_name"):
-                            st.session_state["custom_company_name"] = tpl.get("company_name")
-                        if tpl.get("primary_color"):
-                            st.session_state["custom_primary_color"] = tpl.get("primary_color")
-                        st.success(f"Loaded template: {selected_template}")
-                        st.rerun()
-                else:
-                    st.caption("No saved templates yet")
-
-            with col_save:
-                new_template_name = st.text_input(
-                    "Save as template",
-                    placeholder="Template name",
-                    key="new_template_name"
-                )
-                if st.button("Save", key="save_template_btn"):
-                    if new_template_name:
-                        template_data = {
-                            "logo_url": st.session_state.get("email_logo_url"),
-                            "company_name": st.session_state.get("custom_company_name"),
-                            "primary_color": st.session_state.get("custom_primary_color"),
-                        }
-                        if _save_email_template(new_template_name, template_data):
-                            st.success(f"Template '{new_template_name}' saved!")
-                            st.rerun()
-                    else:
-                        st.warning("Enter a template name to save")
-
-            # Delete template option
-            if template_names:
-                with st.expander("Delete template"):
-                    del_template = st.selectbox(
-                        "Select template to delete",
-                        options=template_names,
-                        key="delete_template_select"
-                    )
-                    if st.button("Delete", key="delete_template_btn", type="secondary"):
-                        if _delete_email_template(del_template):
-                            st.success(f"Deleted template: {del_template}")
-                            st.rerun()
-
-            st.markdown("----")
             st.markdown("#### Actions")
 
             # Interviewer selection for email
@@ -4302,7 +4202,7 @@ def main() -> None:
                     ok = send_email_graph(
                         subject=subject,
                         body=agenda,
-                        to_emails=[candidate_email, hiring_manager_email] + ([recruiter_email] if include_recruiter and recruiter_email else []),
+                        to_emails=[e for e in [candidate_email, hiring_manager_email] if e] + ([recruiter_email] if include_recruiter and recruiter_email else []),
                         attachment={
                             "data": st.session_state["last_invite_ics_bytes"],
                             "maintype": "text",
@@ -5689,17 +5589,14 @@ def _validate_invite_flow(
     for c in invalid_candidates:
         warnings.append(f"Invalid candidate email skipped: {c.original} - {c.error}")
 
-    # Validate hiring manager
+    # Validate hiring manager (optional)
     try:
-        if panel_interviewers:
-            hm_email = validate_email_optional(hm_email_raw, "Hiring manager email")
-        else:
-            hm_email = validate_email(hm_email_raw, "Hiring manager email")
+        hm_email = validate_email_optional(hm_email_raw, "Hiring manager email") or ""
         if hm_email:
             intended_recipients.append(hm_email)
     except ValidationError as e:
         errors.append(str(e))
-        hm_email = None
+        hm_email = ""
 
     # Validate recruiter
     rec_email = None
@@ -5800,11 +5697,7 @@ def _create_individual_invite(
 
     try:
         candidate_email = validate_email(candidate_email_raw, "Candidate email")
-        # Hiring manager email is only required if no panel interviewers
-        if panel_interviewers:
-            hm_email = validate_email_optional(hm_email_raw, "Hiring manager email")
-        else:
-            hm_email = validate_email(hm_email_raw, "Hiring manager email")
+        hm_email = validate_email_optional(hm_email_raw, "Hiring manager email") or ""
         rec_email = validate_email_optional(rec_email_raw, "Recruiter email")
     except ValidationError as e:
         return SchedulingResult(
@@ -5813,7 +5706,7 @@ def _create_individual_invite(
             success=False,
             event_id=None,
             teams_url=None,
-            error=str(e),  # Include field name in error message
+            error=str(e),
             warnings=None,
             recipients=None,
         )
@@ -6177,7 +6070,7 @@ def _create_group_invite(
         candidate_timezone = tz_name
 
     try:
-        hm_email = validate_email(hm_email_raw, "Hiring manager email")
+        hm_email = validate_email_optional(hm_email_raw, "Hiring manager email") or ""
         rec_email = validate_email_optional(rec_email_raw, "Recruiter email")
     except ValidationError as e:
         return SchedulingResult(
@@ -6544,7 +6437,7 @@ def _handle_create_invite(
     # Validate emails
     try:
         candidate_email = validate_email(candidate_email_raw, "Candidate email")
-        hm_email = validate_email(hm_email_raw, "Hiring manager email")
+        hm_email = validate_email_optional(hm_email_raw, "Hiring manager email") or ""
         rec_email = validate_email_optional(rec_email_raw, "Recruiter email")
     except ValidationError as e:
         st.error(f"Validation error: {e.message}")
@@ -6614,7 +6507,8 @@ def _handle_create_invite(
                     pass  # Skip invalid emails
     else:
         # Fall back to single hiring manager (backward compatibility)
-        attendees.append((hm_email, hm_name))
+        if hm_email:
+            attendees.append((hm_email, hm_name))
 
     if include_recruiter and rec_email:
         cc_attendees.append((rec_email, rec_name))  # Recruiter in CC

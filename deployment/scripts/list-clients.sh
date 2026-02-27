@@ -21,7 +21,7 @@ if [ ! -d "$CLIENTS_DIR" ] || [ -z "$(ls -A $CLIENTS_DIR 2>/dev/null)" ]; then
     exit 0
 fi
 
-echo -e "\n%-15s %-8s %-10s %s" "CLIENT" "PORT" "STATUS" "URL"
+printf "\n%-15s %-8s %-10s %s\n" "CLIENT" "PORT" "STATUS" "URL"
 echo "---------------------------------------------------------------"
 
 for client_dir in "$CLIENTS_DIR"/*/; do

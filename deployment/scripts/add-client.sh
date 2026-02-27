@@ -88,8 +88,6 @@ fi
 # Create docker-compose.yml for this client
 echo -e "\n${YELLOW}[3/6] Creating Docker Compose configuration...${NC}"
 cat > "$CLIENTS_DIR/$CLIENT_NAME/docker-compose.yml" << EOF
-version: "3.8"
-
 services:
   app:
     image: powerdash-hr:latest
