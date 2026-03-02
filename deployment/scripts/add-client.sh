@@ -44,7 +44,7 @@ echo -e "${GREEN}========================================${NC}"
 # Find next available port
 echo -e "\n${YELLOW}[1/6] Allocating port...${NC}"
 PORT=$BASE_PORT
-while [ -f "$CLIENTS_DIR"/*/port ] && grep -q "^$PORT$" "$CLIENTS_DIR"/*/port 2>/dev/null; do
+while grep -rq "^$PORT$" "$CLIENTS_DIR"/*/port 2>/dev/null; do
     PORT=$((PORT + 1))
 done
 echo -e "${GREEN}Assigned port: $PORT${NC}"
