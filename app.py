@@ -1520,7 +1520,8 @@ def _render_parsed_slots_list(filtered_slots: List[Dict[str, str]]) -> None:
     all_slots = st.session_state.get("slots", [])
 
     # Scrollable container for the slot list (max 300px height)
-    with st.container(height=300 if len(display_slots) > 5 else None):
+    container_kwargs = {"height": 300} if len(display_slots) > 5 else {}
+    with st.container(**container_kwargs):
         for slot in display_slots:
             # Find the absolute index in session_state["slots"]
             slot_key = (slot["date"], slot["start"], slot["end"])
