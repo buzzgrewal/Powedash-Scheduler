@@ -378,16 +378,15 @@ class CalendarParser:
     ) -> str:
         """Build the appropriate extraction prompt based on detected format."""
 
-        # Build timezone instruction
+        # Build timezone instruction — never ask the model to convert timezones;
+        # always return times exactly as shown in the calendar image.
+        # Programmatic conversion happens later in normalize_slots_to_utc.
         tz_instruction = ""
-        if interviewer_tz and display_tz and interviewer_tz != display_tz:
+        if interviewer_tz:
             tz_instruction = (
-                f"\nTIMEZONE CONVERSION:\n"
-                f"  Calendar shows times in: {interviewer_tz}\n"
-                f"  Convert all times to: {display_tz}\n"
+                f"\nTIMEZONE: The calendar is displayed in {interviewer_tz}.\n"
+                f"Return all times exactly as shown in the calendar. Do NOT convert to any other timezone.\n"
             )
-        elif interviewer_tz:
-            tz_instruction = f"\nTimes are in timezone: {interviewer_tz}. Return as shown.\n"
 
         # Select base prompt
         if calendar_format == CalendarFormat.AGENDA_VIEW:

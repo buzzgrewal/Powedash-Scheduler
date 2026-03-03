@@ -5537,7 +5537,9 @@ def _parse_single_interviewer_availability(interviewer_idx: int) -> None:
         if iv.get("slots"):
             name = iv.get("name") or iv.get("email") or f"Interviewer {iv['id']}"
             interviewer_names_map[iv["id"]] = name
-            normalized = normalize_slots_to_utc(iv["slots"], tz_name)
+            # Use interviewer's own timezone (slots are in their calendar's tz)
+            iv_tz = iv.get("timezone", tz_name)
+            normalized = normalize_slots_to_utc(iv["slots"], iv_tz)
             merged = merge_adjacent_slots(normalized)
             all_interviewer_slots[iv["id"]] = merged
 
@@ -5646,8 +5648,10 @@ def _parse_all_panel_availability() -> None:
                 name = interviewer.get("name") or interviewer.get("email") or f"Interviewer {interviewer['id']}"
                 interviewer_names[interviewer["id"]] = name
 
-                # Normalize to UTC for intersection
-                normalized = normalize_slots_to_utc(interviewer["slots"], tz_name)
+                # Normalize to UTC for intersection — use interviewer's own
+                # timezone since parsed times are in calendar's native tz
+                iv_tz = interviewer.get("timezone", tz_name)
+                normalized = normalize_slots_to_utc(interviewer["slots"], iv_tz)
                 merged = merge_adjacent_slots(normalized)
                 all_interviewer_slots[interviewer["id"]] = merged
 
