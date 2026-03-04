@@ -342,6 +342,61 @@ class GraphClient:
         _, body = self._request("GET", url)
         return body or {}
 
+    # ---------------- Online Meetings ----------------
+    def set_meeting_lobby_bypass(self, join_url: str) -> bool:
+        """
+        Find the Teams online meeting by its join URL and update lobby settings
+        to allow everyone to bypass the lobby (no waiting for organizer).
+
+        Requires OnlineMeetings.ReadWrite.All application permission.
+        Returns True if successful, False if the meeting wasn't found or
+        permissions are missing.
+        """
+        try:
+            # Find the meeting by join URL
+            url = f"{self.cfg.base_url}/users/{self.cfg.scheduler_mailbox}/onlineMeetings"
+            params = {"$filter": f"JoinWebUrl eq '{join_url}'"}
+            _, body = self._request("GET", url, params=params)
+            meetings = (body or {}).get("value", [])
+            if not meetings:
+                log_structured(
+                    LogLevel.WARNING,
+                    "Could not find online meeting to update lobby settings",
+                    action="set_meeting_lobby_bypass",
+                    details={"join_url_prefix": join_url[:80] if join_url else ""},
+                )
+                return False
+
+            meeting_id = meetings[0].get("id")
+            if not meeting_id:
+                return False
+
+            # Patch lobby settings to allow everyone in
+            patch_url = f"{self.cfg.base_url}/users/{self.cfg.scheduler_mailbox}/onlineMeetings/{meeting_id}"
+            self._request("PATCH", patch_url, json_body={
+                "lobbyBypassSettings": {
+                    "scope": "everyone",
+                    "isDialInBypassEnabled": True,
+                },
+            })
+
+            log_structured(
+                LogLevel.INFO,
+                "Updated Teams meeting lobby to allow everyone",
+                action="set_meeting_lobby_bypass",
+                details={"meeting_id": meeting_id},
+            )
+            return True
+        except (GraphAPIError, GraphAuthError) as e:
+            log_structured(
+                LogLevel.WARNING,
+                f"Failed to update lobby settings: {e}",
+                action="set_meeting_lobby_bypass",
+                error_type="lobby_bypass_failed",
+                details={"error": str(e)},
+            )
+            return False
+
     # ---------------- Diagnostics ----------------
     def me(self) -> Dict[str, Any]:
         """Get current user info (app-only tokens usually cannot call /me)."""

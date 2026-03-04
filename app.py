@@ -6299,6 +6299,12 @@ def _create_individual_invite(
                 )
                 warnings.append("Teams meeting was requested but no join URL was returned")
 
+            # Try to update lobby settings so attendees can join without waiting.
+            # This requires OnlineMeetings.ReadWrite.All + a Teams application access policy.
+            # If unavailable, lobby policy should be set in Teams Admin Center instead.
+            if teams_url:
+                client.set_meeting_lobby_bypass(teams_url)
+
         # Validate Graph response contains expected attendees
         response_attendees = created.get("attendees", [])
         response_emails = {
@@ -6660,6 +6666,12 @@ def _create_group_invite(
                 )
                 warnings.append("Teams meeting was requested but no join URL was returned")
 
+            # Try to update lobby settings so attendees can join without waiting.
+            # This requires OnlineMeetings.ReadWrite.All + a Teams application access policy.
+            # If unavailable, lobby policy should be set in Teams Admin Center instead.
+            if teams_url:
+                client.set_meeting_lobby_bypass(teams_url)
+
         # Validate Graph response contains expected attendees
         response_attendees = created.get("attendees", [])
         response_emails = {
@@ -6964,6 +6976,12 @@ def _handle_create_invite(
         teams_url = ""
         if is_teams:
             teams_url = (created.get("onlineMeeting") or {}).get("joinUrl") or ""
+            # Update lobby settings so attendees can join without waiting
+            # Try to update lobby settings so attendees can join without waiting.
+            # This requires OnlineMeetings.ReadWrite.All + a Teams application access policy.
+            # If unavailable, lobby policy should be set in Teams Admin Center instead.
+            if teams_url:
+                client.set_meeting_lobby_bypass(teams_url)
         st.session_state["last_graph_event_id"] = event_id
         st.session_state["last_teams_join_url"] = teams_url
 
