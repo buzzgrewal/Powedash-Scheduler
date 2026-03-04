@@ -1294,6 +1294,11 @@ def _add_manual_slot(interviewer_idx: int, slot_date, start_time, end_time) -> b
     existing_slots.append(new_slot)
     st.session_state["panel_interviewers"][interviewer_idx]["slots"] = existing_slots
     _save_persisted_slots()
+
+    # Auto-recompute global slots so they're immediately available
+    # for email generation and UI display without requiring "Parse All"
+    _parse_all_panel_availability()
+
     st.success(f"Added slot: {format_slot_label(new_slot)}")
     return True
 
@@ -1309,6 +1314,8 @@ def _delete_interviewer_slot(interviewer_idx: int, slot_idx: int) -> None:
         deleted = slots.pop(slot_idx)
         st.session_state["panel_interviewers"][interviewer_idx]["slots"] = slots
         _save_persisted_slots()
+        # Recompute global slots to reflect the deletion
+        _parse_all_panel_availability()
         st.toast(f"Deleted: {format_slot_label(deleted)}")
         st.rerun()
 
@@ -3646,7 +3653,7 @@ def main() -> None:
         page_title=f"{base_name} Interview Scheduler",
         page_icon=get_secret("company_favicon_url", "🗓️"),
         layout="wide",
-        initial_sidebar_state="auto",
+        initial_sidebar_state="collapsed",
     )
 
     ensure_session_state()
@@ -4236,6 +4243,21 @@ def main() -> None:
                 # This ensures edits/deletions made in the UI are reflected in the email
                 # and respects the current availability filter mode
                 source_slots = st.session_state.get("filtered_slots_for_email", st.session_state.get("slots", []))
+
+                # Auto-compute slots from panel interviewers if not yet computed
+                # This handles the case where manual slots were added but
+                # "Parse All Availability" was never clicked
+                if not source_slots:
+                    has_any_slots = any(
+                        iv.get("slots")
+                        for iv in st.session_state.get("panel_interviewers", [])
+                    )
+                    if has_any_slots:
+                        _parse_all_panel_availability()
+                        source_slots = st.session_state.get(
+                            "filtered_slots_for_email",
+                            st.session_state.get("slots", []),
+                        )
 
                 if not source_slots:
                     st.error("No slots available. Please add availability first.")
